@@ -26,7 +26,7 @@ def git_changed_files(base: str, head: str) -> str:
     return run(f"git diff --name-only {base} {head}")
 
 
-def read_docs_snippets(doc_dir: str = "docs", max_chars: int = 4000) -> str:
+def read_docs_snippets(doc_dir: str = "docs", max_chars: int = 2000) -> str:
     """Concatenate repo docs (RAG-lite context) with simple size cap."""
     buf = []
     for path in glob.glob(f"{doc_dir}/**/*", recursive=True):
@@ -101,7 +101,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     gb = (os.getenv("LLM_API_BASE") or "").strip()
 
     temperature = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
-    max_tokens  = int((os.getenv("OPENAI_MAX_TOKENS")  or "800").strip())  # slightly lower to reduce usage
+    max_tokens  = int((os.getenv("OPENAI_MAX_TOKENS")  or "600").strip())  # slightly lower to reduce usage
 
     if ok:
         headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
@@ -189,7 +189,8 @@ def main():
     ap.add_argument("--head", required=True)
     args = ap.parse_args()
 
-    diff = git_diff(args.base, args.head)[:20000]
+    diff = git_diff(args.base, args.head)[:8000]
+
     if not diff.strip():
         with open("ai_review_report.md", "w", encoding="utf-8") as f:
             f.write(
