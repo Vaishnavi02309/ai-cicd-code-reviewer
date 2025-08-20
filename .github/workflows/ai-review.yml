@@ -1,121 +1,120 @@
 name: AI Code Review
 
 on:
+  # Show checks on every commit (lightweight path)
+  push:
+    branches: ['**']
+  # Run the full AI review only on PRs
   pull_request:
     types: [opened, synchronize, reopened]
     branches: [ main, master ]
-    paths:
-      - "src/**"
-      - "project/**"
-      - "docs/**"
-      - ".github/workflows/ai-review.yml"
+  # Manual run button in the Actions tab
+  workflow_dispatch: {}
 
+# Cancel older runs for the same ref to avoid queues / extra API calls
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-on:
-  push: { branches: [ main, master ] }
-  pull_request: { branches: [ main, master ] }
-
 jobs:
   review:
     runs-on: ubuntu-latest
-    permissions: { contents: read, pull-requests: write }
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - run: pip install -r requirements.txt
+      # Install deps only for PRs (push jobs stay fast)
+      - name: Install deps
+        if: ${{ github.event_name == 'pull_request' }}
+        run: pip install -r requirements.txt
 
       - name: Compute DIFF SHAs
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "BASE=${{ github.event.pull_request.base.sha }}" >> $GITHUB_ENV
             echo "HEAD=${{ github.sha }}" >> $GITHUB_ENV
           else
-            if [ -z "${{ github.event.before }}" ] || [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
-              git rev-parse HEAD~1 >/dev/null 2>&1 && echo "BASE=$(git rev-parse HEAD~1)" >> $GITHUB_ENV || echo "BASE=${{ github.sha }}" >> $GITHUB_ENV
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              if git rev-parse HEAD~1 >/dev/null 2>&1; then
+                echo "BASE=$(git rev-parse HEAD~1)" >> $GITHUB_ENV
+              else
+                echo "BASE=${{ github.sha }}" >> $GITHUB_ENV
+              fi
             else
-              echo "BASE=${{ github.event.before }}" >> $GITHUB_ENV
+              echo "BASE=$BEFORE" >> $GITHUB_ENV
             fi
             echo "HEAD=${{ github.sha }}" >> $GITHUB_ENV
           fi
-      - name: Sanity check OpenAI key (temp)
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          python - << 'PY'
-          import os, requests
-          r = requests.get(
-            'https://api.openai.com/v1/models',
-            headers={'Authorization': f"Bearer {os.environ['OPENAI_API_KEY']}"},
-            timeout=30
-          )
-          print('status:', r.status_code)
-          print(r.text[:300])
-          PY
-      - name: List available models (temp)
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-        run: |
-          python - << 'PY'
-          import os, requests, json
-          base = (os.environ.get('OPENAI_BASE_URL') or 'https://api.openai.com/v1').rstrip('/')
-          r = requests.get(base + '/models', headers={'Authorization': f"Bearer {os.environ['OPENAI_API_KEY']}"}, timeout=30)
-          print('status:', r.status_code)
-          try:
-            data = r.json()
-            ids = [m.get('id') for m in (data.get('data') or [])]
-            print('first 50 model ids:', ids[:50])
-            open('models.json','w').write(json.dumps(ids, indent=2))
-          except Exception:
-            print(r.text[:500])
-            raise
-          PY
+          echo "Using BASE=$BASE HEAD=$HEAD"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: models
-          path: models.json
+      # --- PR-only heavy steps below ----------------------------------------
 
       - name: Run AI reviewer
+        if: ${{ github.event_name == 'pull_request' }}
         env:
+          # Secrets (provider auth)
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_API_BASE: ${{ secrets.LLM_API_BASE }}
+          # Tunables (safe to store as repo "Variables" in Actions)
+          OPENAI_TEMPERATURE: ${{ vars.OPENAI_TEMPERATURE }}
+          OPENAI_MAX_TOKENS: ${{ vars.OPENAI_MAX_TOKENS }}
+          OPENAI_PRE_DELAY_SEC: ${{ vars.OPENAI_PRE_DELAY_SEC }}
+          OPENAI_MAX_ATTEMPTS: ${{ vars.OPENAI_MAX_ATTEMPTS }}
+          OPENAI_BACKOFF_CAP_SEC: ${{ vars.OPENAI_BACKOFF_CAP_SEC }}
         run: python -m src.reviewer --base "$BASE" --head "$HEAD"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload review report (artifact)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v4
         with:
           name: ai_review_report
           path: ai_review_report.md
           if-no-files-found: warn
 
-      - name: Run Git Insights
+      - name: Run Git Insights (generate insights.json)
+        if: ${{ github.event_name == 'pull_request' }}
         run: python -m project.cli --limit 100 --out insights.json || echo "Git Insights failed"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload Git Insights (artifact)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v4
         with:
           name: git_insights
           path: insights.json
           if-no-files-found: warn
 
-      - if: ${{ github.event_name == 'pull_request' }}
+      - name: Comment on PR with review
+        if: ${{ github.event_name == 'pull_request' }}
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const body = fs.readFileSync('ai_review_report.md','utf8');
-            github.rest.issues.createComment({
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
               body
             });
+
+      # Push-only placeholder so you still get yellow/green on commits
+      - name: Push workflow placeholder
+        if: ${{ github.event_name == 'push' }}
+        run: echo "Push workflow completed (AI review runs on PRs)."
