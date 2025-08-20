@@ -108,7 +108,167 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     elif pre_delay > 0:
         time.sleep(pre_delay)
 
-    def post_with_retries(url, headers, payload, timeout=60):
+    def post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60):
         last_exc = None
-        for attempt in range
-::contentReference[oaicite:0]{index=0}
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                # Retry on rate limits or transient server errors
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    ra = resp.headers.get("retry-after")
+                    try:
+                        wait = int(ra) if ra else 0
+                    except Exception:
+                        wait = 0
+                    if wait <= 0:
+                        wait = min(2 ** attempt + random.random(), backoff_cap)
+                    time.sleep(wait)
+                    last_exc = requests.HTTPError(f"{resp.status_code} {resp.reason}", response=resp)
+                    continue
+                resp.raise_for_status()
+                return resp
+            except requests.RequestException as e:
+                # network hiccup; backoff and retry
+                last_exc = e
+                wait = min(2 ** attempt + random.random(), backoff_cap)
+                time.sleep(wait)
+        # give up
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("unexpected retry loop exit")
+
+    # ---- OpenAI-compatible path --------------------------------------------
+    if ok:
+        headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
+        if org:
+            headers["OpenAI-Organization"] = org
+        if proj:
+            headers["OpenAI-Project"] = proj
+
+        # 1) Try Chat Completions first
+        try:
+            url = ob.rstrip("/") + "/chat/completions"
+            payload = {
+                "model": om,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            r = post_with_retries(url, headers, payload)
+            data = r.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except requests.HTTPError as e:
+            txt = (getattr(e, "response", None).text if getattr(e, "response", None) else "") or ""
+            # If the endpoint itself is unsupported, fall through to /responses
+            if e.response is None or (e.response.status_code not in (404,) and "Unrecognized request URL" not in txt):
+                # Not an endpoint issue -> re-raise (e.g., hard 401)
+                raise
+        except Exception:
+            # Non-HTTP exception; try /responses path next
+            pass
+
+        # 2) Responses API attempt A (structured role/content)
+        try:
+            url = ob.rstrip("/") + "/responses"
+            payload = {
+                "model": om,
+                "input": [
+                    {"role": "system", "content": [{"type": "text", "text": system_msg}]},
+                    {"role": "user", "content": [{"type": "text", "text": user_msg}]},
+                ],
+                "temperature": temperature,
+                "max_output_tokens": max_tokens,
+            }
+            r = post_with_retries(url, headers, payload)
+            data = r.json()
+            if "output_text" in data:
+                return str(data["output_text"]).strip()
+            if isinstance(data.get("content"), list):
+                parts = []
+                for c in data["content"]:
+                    if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
+                        parts.append(str(c.get("text", c.get("output_text", ""))))
+                if parts:
+                    return "\n".join(parts).strip()
+        except Exception:
+            pass
+
+        # 3) Responses API attempt B (simple string input)
+        url = ob.rstrip("/") + "/responses"
+        payload = {
+            "model": om,
+            "input": f"{system_msg}\n\n{user_msg}",
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+        r = post_with_retries(url, headers, payload)
+        data = r.json()
+        if "output_text" in data:
+            return str(data["output_text"]).strip()
+        return json.dumps(data)[:4000]
+
+    # ---- Generic non-OpenAI provider ---------------------------------------
+    if gk and gb:
+        import requests  # explicit
+        headers = {"Authorization": f"Bearer {gk}", "Content-Type": "application/json"}
+        payload = {
+            "prompt": f"{system_msg}\n\n{user_msg}",
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        url = gb.rstrip("/")
+        r = post_with_retries(url, headers, payload)
+        data = r.json()
+        for key in ("text", "output", "completion", "result"):
+            if key in data:
+                return str(data[key]).strip()
+        return json.dumps(data)[:4000]
+
+    raise RuntimeError("No LLM credentials found. Set OPENAI_* or LLM_API_* in GitHub Secrets.")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--head", required=True)
+    args = ap.parse_args()
+
+    diff = git_diff(args.base, args.head)[:8000]
+    if not diff.strip():
+        with open("ai_review_report.md", "w", encoding="utf-8") as f:
+            f.write(
+                "# 🤖 AI Code Review Report\n\n"
+                f"No code changes detected between {args.base} → {args.head}.\n"
+            )
+        print("No code changes; wrote ai_review_report.md")
+        return
+
+    commit_msg = git_commit_message(args.head)
+    docs = read_docs_snippets("docs", max_chars=2000)
+    files = git_changed_files(args.base, args.head)
+    files_block = "\n".join(f"- {p}" for p in files.splitlines() if p.strip())
+
+    sys_msg, user_msg = build_prompt(commit_msg, diff, docs, files_block)
+
+    try:
+        review = call_llm(sys_msg, user_msg)
+    except Exception as e:
+        review = (
+            f"**Note:** LLM call failed in CI: {e}\n\n"
+            "Proceeding with a static stub so the pipeline stays green."
+        )
+
+    banner = (
+        "# 🤖 AI Code Review Report\n\n"
+        f"**Base:** `{args.base}`  \n**Head:** `{args.head}`\n\n---\n\n"
+    )
+    with open("ai_review_report.md", "w", encoding="utf-8") as f:
+        f.write(banner + review + "\n")
+    print("Wrote ai_review_report.md")
+
+
+if __name__ == "__main__":
+    main()
