@@ -62,23 +62,28 @@ jobs:
           echo "Using BASE=$BASE HEAD=$HEAD"
 
       # --- PR-only heavy steps below ----------------------------------------
+      - name: Install deps
+  	if: ${{ github.event_name == 'pull_request' }}
+  	run: pip install -r requirements.txt
 
       - name: Run AI reviewer
         if: ${{ github.event_name == 'pull_request' }}
         env:
-          # Secrets (provider auth)
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    	  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_API_BASE: ${{ secrets.LLM_API_BASE }}
-          # Tunables (safe to store as repo "Variables" in Actions)
-          OPENAI_TEMPERATURE: ${{ vars.OPENAI_TEMPERATURE }}
-          OPENAI_MAX_TOKENS: ${{ vars.OPENAI_MAX_TOKENS }}
-          OPENAI_PRE_DELAY_SEC: ${{ vars.OPENAI_PRE_DELAY_SEC }}
-          OPENAI_MAX_ATTEMPTS: ${{ vars.OPENAI_MAX_ATTEMPTS }}
-          OPENAI_BACKOFF_CAP_SEC: ${{ vars.OPENAI_BACKOFF_CAP_SEC }}
-        run: python -m src.reviewer --base "$BASE" --head "$HEAD"
+    	  OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+    	  LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+    	  LLM_API_BASE: ${{ secrets.LLM_API_BASE }}
+    	  OPENAI_TEMPERATURE: ${{ vars.OPENAI_TEMPERATURE }}
+    	  OPENAI_MAX_TOKENS: ${{ vars.OPENAI_MAX_TOKENS }}
+    	  OPENAI_PRE_DELAY_SEC: ${{ vars.OPENAI_PRE_DELAY_SEC }}
+     	  OPENAI_MAX_ATTEMPTS: ${{ vars.OPENAI_MAX_ATTEMPTS }}
+    	  OPENAI_BACKOFF_CAP_SEC: ${{ vars.OPENAI_BACKOFF_CAP_SEC }}
+  	run: python -m src.reviewer --base "$BASE" --head "$HEAD"
+          PPLX_API_KEY: ${{ secrets.PPLX_API_KEY }}
+          PPLX_BASE_URL: ${{ secrets.PPLX_BASE_URL }}
+          PPLX_MODEL: ${{ secrets.PPLX_MODEL }}
+
 
       - name: Upload review report (artifact)
         if: ${{ github.event_name == 'pull_request' }}

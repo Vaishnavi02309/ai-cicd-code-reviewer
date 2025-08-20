@@ -28,7 +28,7 @@ def git_changed_files(base: str, head: str) -> str:
     return run(f"git diff --name-only {base} {head}")
 
 
-def read_docs_snippets(doc_dir: str = "docs", max_chars: int = 2000) -> str:
+def read_docs_snippets(doc_dir: str = "docs", max_chars: int = 1000) -> str:
     """Concatenate repo docs (RAG-lite context) with simple size cap."""
     buf = []
     for path in glob.glob(f"{doc_dir}/**/*", recursive=True):
@@ -86,6 +86,19 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     om = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
     org = (os.getenv("OPENAI_ORG") or "").strip()
     proj = (os.getenv("OPENAI_PROJECT") or "").strip()
+        # Perplexity-specific envs (optional, take precedence if present)
+    pplx_key   = (os.getenv("PPLX_API_KEY") or os.getenv("PERPLEXITY_API_KEY") or "").strip()
+    pplx_base  = (os.getenv("PPLX_BASE_URL") or "https://api.perplexity.ai").strip()
+    pplx_model = (os.getenv("PPLX_MODEL") or "llama-3.1-sonar-small-128k-chat").strip()
+
+    # Prefer Perplexity if a PPLX key is provided; otherwise use OPENAI_* values
+    if pplx_key:
+        ok, ob, om = pplx_key, pplx_base, pplx_model
+
+    # If someone set OPENAI_BASE_URL to perplexity, normalize it
+    if "perplexity.ai" in ob:
+        ob = "https://api.perplexity.ai"
+
 
     gk = (os.getenv("LLM_API_KEY") or "").strip()
     gb = (os.getenv("LLM_API_BASE") or "").strip()
@@ -236,7 +249,7 @@ def main():
     ap.add_argument("--head", required=True)
     args = ap.parse_args()
 
-    diff = git_diff(args.base, args.head)[:8000]
+    diff = git_diff(args.base, args.head)[:4000]
     if not diff.strip():
         with open("ai_review_report.md", "w", encoding="utf-8") as f:
             f.write(
@@ -247,7 +260,7 @@ def main():
         return
 
     commit_msg = git_commit_message(args.head)
-    docs = read_docs_snippets("docs", max_chars=2000)
+    docs = read_docs_snippets("docs", max_chars=1000)
     files = git_changed_files(args.base, args.head)
     files_block = "\n".join(f"- {p}" for p in files.splitlines() if p.strip())
 
