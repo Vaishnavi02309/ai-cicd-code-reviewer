@@ -104,3 +104,4 @@ def collect_summary(limit: int = 50, top_k: int = 5) -> GitSummary:
         top_files=top_files,
         top_words=top_words
     )
+# TODO: improve tokenizer 
