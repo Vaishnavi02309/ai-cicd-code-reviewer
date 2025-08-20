@@ -30,6 +30,44 @@ jobs:
             fi
             echo "HEAD=${{ github.sha }}" >> $GITHUB_ENV
           fi
+      - name: Sanity check OpenAI key (temp)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python - << 'PY'
+          import os, requests
+          r = requests.get(
+            'https://api.openai.com/v1/models',
+            headers={'Authorization': f"Bearer {os.environ['OPENAI_API_KEY']}"},
+            timeout=30
+          )
+          print('status:', r.status_code)
+          print(r.text[:300])
+          PY
+      - name: List available models (temp)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        run: |
+          python - << 'PY'
+          import os, requests, json
+          base = (os.environ.get('OPENAI_BASE_URL') or 'https://api.openai.com/v1').rstrip('/')
+          r = requests.get(base + '/models', headers={'Authorization': f"Bearer {os.environ['OPENAI_API_KEY']}"}, timeout=30)
+          print('status:', r.status_code)
+          try:
+            data = r.json()
+            ids = [m.get('id') for m in (data.get('data') or [])]
+            print('first 50 model ids:', ids[:50])
+            open('models.json','w').write(json.dumps(ids, indent=2))
+          except Exception:
+            print(r.text[:500])
+            raise
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: models
+          path: models.json
 
       - name: Run AI reviewer
         env:
