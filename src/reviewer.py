@@ -69,7 +69,27 @@ def build_prompt(commit_msg: str, diff_text: str, docs_context: str, files_block
 
 
 def call_llm(system_msg: str, user_msg: str) -> str:
-    import requests, json, os
+    import requests, json, os, time, random
+
+    def post_with_retries(url, headers, payload, timeout=60, max_attempts=4):
+        for attempt in range(1, max_attempts + 1):
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            # if not a rate-limit, raise or return immediately
+            if resp.status_code != 429:
+                resp.raise_for_status()
+                return resp
+            # backoff on 429
+            ra = resp.headers.get("retry-after")
+            try:
+                wait = int(ra) if ra else 0
+            except Exception:
+                wait = 0
+            if wait <= 0:
+                wait = min(2 ** attempt + random.random(), 15)  # jitter
+            time.sleep(wait)
+        # last try result:
+        resp.raise_for_status()
+        return resp
 
     ok = (os.getenv("OPENAI_API_KEY") or "").strip()
     ob = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
@@ -81,14 +101,14 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     gb = (os.getenv("LLM_API_BASE") or "").strip()
 
     temperature = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
-    max_tokens  = int((os.getenv("OPENAI_MAX_TOKENS")  or "1000").strip())
+    max_tokens  = int((os.getenv("OPENAI_MAX_TOKENS")  or "800").strip())  # slightly lower to reduce usage
 
     if ok:
         headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
         if org:  headers["OpenAI-Organization"] = org
         if proj: headers["OpenAI-Project"] = proj
 
-        # 1) Try Chat Completions first
+        # 1) Try Chat Completions with retry-on-429
         try:
             url = ob.rstrip("/") + "/chat/completions"
             payload = {
@@ -100,15 +120,18 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             }
-            r = requests.post(url, headers=headers, json=payload, timeout=60)
-            if r.status_code == 404 or "Unrecognized request URL" in (r.text or ""):
-                raise RuntimeError("chat_completions_not_supported")
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
+            r = post_with_retries(url, headers, payload)
+            data = r.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except requests.HTTPError as e:
+            # fall back to /responses only if chat endpoint itself is unsupported
+            txt = getattr(e.response, "text", "") or ""
+            if "Unrecognized request URL" not in txt and e.response.status_code != 404:
+                raise
         except Exception:
-            pass  # fall through to /responses
+            pass  # try /responses below
 
-        # 2) Responses attempt A: role+content objects
+        # 2) Responses API attempt A (structured)
         try:
             url = ob.rstrip("/") + "/responses"
             payload = {
@@ -120,8 +143,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 "temperature": temperature,
                 "max_output_tokens": max_tokens,
             }
-            r = requests.post(url, headers=headers, json=payload, timeout=60)
-            r.raise_for_status()
+            r = post_with_retries(url, headers, payload)
             data = r.json()
             if "output_text" in data:
                 return str(data["output_text"]).strip()
@@ -132,11 +154,10 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                         parts.append(str(c.get("text", c.get("output_text", ""))))
                 if parts:
                     return "\n".join(parts).strip()
-            # if still no text, fall to attempt B
         except Exception:
             pass
 
-        # 3) Responses attempt B: simple string input
+        # 3) Responses API attempt B (simple string)
         url = ob.rstrip("/") + "/responses"
         payload = {
             "model": om,
@@ -144,8 +165,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             "temperature": temperature,
             "max_output_tokens": max_tokens,
         }
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
+        r = post_with_retries(url, headers, payload)
         data = r.json()
         if "output_text" in data:
             return str(data["output_text"]).strip()
@@ -155,8 +175,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     if gk and gb:
         headers = {"Authorization": f"Bearer {gk}", "Content-Type": "application/json"}
         payload = {"prompt": f"{system_msg}\n\n{user_msg}", "max_tokens": max_tokens, "temperature": temperature}
-        r = requests.post(gb.rstrip("/"), headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
+        r = post_with_retries(gb.rstrip("/"), headers, payload)
         data = r.json()
         for key in ("text", "output", "completion", "result"):
             if key in data:
@@ -164,8 +183,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
         return json.dumps(data)[:4000]
 
     raise RuntimeError("No LLM credentials found. Set OPENAI_* or LLM_API_* in GitHub Secrets.")
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
