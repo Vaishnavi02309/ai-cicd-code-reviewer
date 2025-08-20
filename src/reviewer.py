@@ -4,6 +4,8 @@ import argparse
 import textwrap
 import json
 import glob
+import time
+import random
 
 
 def run(cmd: str) -> str:
@@ -69,28 +71,16 @@ def build_prompt(commit_msg: str, diff_text: str, docs_context: str, files_block
 
 
 def call_llm(system_msg: str, user_msg: str) -> str:
-    import requests, json, os, time, random
+    """
+    Call OpenAI-compatible APIs with resilience:
+      - small pre-call jitter (to avoid hotspots)
+      - retries with exponential backoff on 429/5xx
+      - prefer /chat/completions; fallback to /responses (two shapes)
+      - reads OPENAI_TEMPERATURE and OPENAI_MAX_TOKENS
+    """
+    import requests
 
-    def post_with_retries(url, headers, payload, timeout=60, max_attempts=4):
-        for attempt in range(1, max_attempts + 1):
-            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            # if not a rate-limit, raise or return immediately
-            if resp.status_code != 429:
-                resp.raise_for_status()
-                return resp
-            # backoff on 429
-            ra = resp.headers.get("retry-after")
-            try:
-                wait = int(ra) if ra else 0
-            except Exception:
-                wait = 0
-            if wait <= 0:
-                wait = min(2 ** attempt + random.random(), 15)  # jitter
-            time.sleep(wait)
-        # last try result:
-        resp.raise_for_status()
-        return resp
-
+    # ---- Config (trim whitespace) -------------------------------------------
     ok = (os.getenv("OPENAI_API_KEY") or "").strip()
     ob = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
     om = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
@@ -100,130 +90,25 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     gk = (os.getenv("LLM_API_KEY") or "").strip()
     gb = (os.getenv("LLM_API_BASE") or "").strip()
 
+    # Tuning knobs (env-overridable)
     temperature = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
-    max_tokens  = int((os.getenv("OPENAI_MAX_TOKENS")  or "600").strip())  # slightly lower to reduce usage
-
-    if ok:
-        headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
-        if org:  headers["OpenAI-Organization"] = org
-        if proj: headers["OpenAI-Project"] = proj
-
-        # 1) Try Chat Completions with retry-on-429
-        try:
-            url = ob.rstrip("/") + "/chat/completions"
-            payload = {
-                "model": om,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            r = post_with_retries(url, headers, payload)
-            data = r.json()
-            return data["choices"][0]["message"]["content"].strip()
-        except requests.HTTPError as e:
-            # fall back to /responses only if chat endpoint itself is unsupported
-            txt = getattr(e.response, "text", "") or ""
-            if "Unrecognized request URL" not in txt and e.response.status_code != 404:
-                raise
-        except Exception:
-            pass  # try /responses below
-
-        # 2) Responses API attempt A (structured)
-        try:
-            url = ob.rstrip("/") + "/responses"
-            payload = {
-                "model": om,
-                "input": [
-                    {"role": "system", "content": [{"type": "text", "text": system_msg}]},
-                    {"role": "user",   "content": [{"type": "text", "text": user_msg}]},
-                ],
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-            }
-            r = post_with_retries(url, headers, payload)
-            data = r.json()
-            if "output_text" in data:
-                return str(data["output_text"]).strip()
-            if isinstance(data.get("content"), list):
-                parts = []
-                for c in data["content"]:
-                    if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
-                        parts.append(str(c.get("text", c.get("output_text", ""))))
-                if parts:
-                    return "\n".join(parts).strip()
-        except Exception:
-            pass
-
-        # 3) Responses API attempt B (simple string)
-        url = ob.rstrip("/") + "/responses"
-        payload = {
-            "model": om,
-            "input": f"{system_msg}\n\n{user_msg}",
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        }
-        r = post_with_retries(url, headers, payload)
-        data = r.json()
-        if "output_text" in data:
-            return str(data["output_text"]).strip()
-        return json.dumps(data)[:4000]
-
-    # Generic non-OpenAI provider
-    if gk and gb:
-        headers = {"Authorization": f"Bearer {gk}", "Content-Type": "application/json"}
-        payload = {"prompt": f"{system_msg}\n\n{user_msg}", "max_tokens": max_tokens, "temperature": temperature}
-        r = post_with_retries(gb.rstrip("/"), headers, payload)
-        data = r.json()
-        for key in ("text", "output", "completion", "result"):
-            if key in data:
-                return str(data[key]).strip()
-        return json.dumps(data)[:4000]
-
-    raise RuntimeError("No LLM credentials found. Set OPENAI_* or LLM_API_* in GitHub Secrets.")
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--base", required=True)
-    ap.add_argument("--head", required=True)
-    args = ap.parse_args()
-
-    diff = git_diff(args.base, args.head)[:8000]
-
-    if not diff.strip():
-        with open("ai_review_report.md", "w", encoding="utf-8") as f:
-            f.write(
-                f"# 🤖 AI Code Review Report\n\n"
-                f"No code changes detected between {args.base} → {args.head}.\n"
-            )
-        print("No code changes; wrote ai_review_report.md")
-        return
-
-    commit_msg = git_commit_message(args.head)
-    docs = read_docs_snippets("docs")
-    files = git_changed_files(args.base, args.head)
-    files_block = "\n".join(f"- {p}" for p in files.splitlines() if p.strip())
-
-    sys_msg, user_msg = build_prompt(commit_msg, diff, docs, files_block)
-
-    # Keep CI green even if the model call fails
+    max_tokens = int((os.getenv("OPENAI_MAX_TOKENS") or "600").strip())
+    pre_delay = os.getenv("OPENAI_PRE_DELAY_SEC")
     try:
-        review = call_llm(sys_msg, user_msg)
-    except Exception as e:
-        review = (
-            f"**Note:** LLM call failed in CI: {e}\n\n"
-            "Proceeding with a static stub so the pipeline stays green."
-        )
+        pre_delay = float(pre_delay) if pre_delay is not None else None
+    except ValueError:
+        pre_delay = None
+    # Retry controls
+    max_attempts = int((os.getenv("OPENAI_MAX_ATTEMPTS") or "5").strip())
+    backoff_cap = int((os.getenv("OPENAI_BACKOFF_CAP_SEC") or "25").strip())
 
-    banner = (
-        "# 🤖 AI Code Review Report\n\n"
-        f"**Base:** `{args.base}`  \n**Head:** `{args.head}`\n\n---\n\n"
-    )
-    with open("ai_review_report.md", "w", encoding="utf-8") as f:
-        f.write(banner + review + "\n")
-    print("Wrote ai_review_report.md")
+    # Small jitter before first call to dodge bursts
+    if pre_delay is None:
+        time.sleep(random.uniform(0.8, 1.8))
+    elif pre_delay > 0:
+        time.sleep(pre_delay)
 
-
-if __name__ == "__main__":
-    main()
+    def post_with_retries(url, headers, payload, timeout=60):
+        last_exc = None
+        for attempt in range
+::contentReference[oaicite:0]{index=0}
