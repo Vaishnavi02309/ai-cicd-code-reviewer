@@ -1,4 +1,16 @@
 import os, subprocess, argparse, textwrap, json, glob
+import requests
+
+# Trim whitespace to avoid invalid header issues
+ok = (os.getenv('OPENAI_API_KEY') or '').strip()
+ob = (os.getenv('OPENAI_BASE_URL') or 'https://api.openai.com/v1').strip()
+om = (os.getenv('OPENAI_MODEL') or 'gpt-4o-mini').strip()
+
+gk = (os.getenv('LLM_API_KEY') or '').strip()
+gb = (os.getenv('LLM_API_BASE') or '').strip()
+
+temperature = float((os.getenv('OPENAI_TEMPERATURE') or '0.2').strip())
+max_tokens  = int((os.getenv('OPENAI_MAX_TOKENS')  or '1000').strip())
 
 def run(cmd):
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
