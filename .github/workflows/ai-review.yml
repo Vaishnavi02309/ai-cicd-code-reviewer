@@ -121,9 +121,12 @@ jobs:
           # Generic fallback (unused unless wired)
           LLM_API_KEY:            ${{ secrets.LLM_API_KEY }}
           LLM_API_BASE:           ${{ secrets.LLM_API_BASE }}
+          PYTHONUNBUFFERED: "1"
+
         run: |
-          python -m src.reviewer --base "$BASE" --head "$HEAD" || \
-            echo "::warning::AI reviewer failed (transient?). Report may be partial."
+          set -e
+          timeout 300 python -m src.reviewer --base "$BASE" --head "$HEAD" || \
+            echo "::warning::AI reviewer exceeded time or failed. Report may be partial."
 
       - name: Upload review report (artifact)
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
@@ -145,29 +148,34 @@ jobs:
           path: insights.json
           if-no-files-found: warn
 
-      - name: Comment on PR with review
+      # Prepare a comment body with a stable marker so we can update-in-place
+      - name: Prepare AI review comment body
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
-        uses: actions/github-script@v7
-        continue-on-error: true
+        run: |
+          echo "<!-- ai-review-report -->" > comment.md
+          cat ai_review_report.md >> comment.md
+
+      # Find an existing comment from the bot that contains our marker
+      - name: Find existing AI review comment
+        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
+        id: find_comment
+        uses: peter-evans/find-comment@v3
         with:
-          script: |
-            const fs = require('fs');
-            const core = require('@actions/core');
-            try {
-              if (fs.existsSync('ai_review_report.md')) {
-                const body = fs.readFileSync('ai_review_report.md','utf8');
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: context.issue.number,
-                  body
-                });
-              } else {
-                core.warning('ai_review_report.md not found; skipping PR comment.');
-              }
-            } catch (e) {
-              core.warning(`Failed to comment on PR: ${e?.message || e}`);
-            }
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- ai-review-report -->'
+
+      # Create or update the comment (sticky)
+      - name: Create or update AI review comment
+        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: comment.md
+          edit-mode: replace
+
+
 
       - name: Push workflow placeholder
         if: ${{ github.event_name == 'push' }}
