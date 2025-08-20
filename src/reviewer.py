@@ -6,6 +6,10 @@ import json
 import glob
 import time
 import random
+import hashlib
+import pathlib
+from datetime import datetime, timedelta
+
 
 
 def run(cmd: str) -> str:
@@ -81,23 +85,27 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     import requests
 
     # ---- Config (trim whitespace) -------------------------------------------
+        # ---- Config (trim whitespace) -------------------------------------------
     ok = (os.getenv("OPENAI_API_KEY") or "").strip()
     ob = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
-    om = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    om = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
     org = (os.getenv("OPENAI_ORG") or "").strip()
     proj = (os.getenv("OPENAI_PROJECT") or "").strip()
-        # Perplexity-specific envs (optional, take precedence if present)
+
+    # Perplexity (optional)
+    prefer_pplx = (os.getenv("PREFER_PPLX") or "0").strip() in ("1", "true", "TRUE", "yes", "YES")
     pplx_key   = (os.getenv("PPLX_API_KEY") or os.getenv("PERPLEXITY_API_KEY") or "").strip()
     pplx_base  = (os.getenv("PPLX_BASE_URL") or "https://api.perplexity.ai").strip()
     pplx_model = (os.getenv("PPLX_MODEL") or "llama-3.1-sonar-small-128k-chat").strip()
 
-    # Prefer Perplexity if a PPLX key is provided; otherwise use OPENAI_* values
-    if pplx_key:
+    # Choose provider: OpenAI by default; Perplexity only if explicitly preferred and key is present
+    if prefer_pplx and pplx_key:
         ok, ob, om = pplx_key, pplx_base, pplx_model
 
-    # If someone set OPENAI_BASE_URL to perplexity, normalize it
+    # Normalize base URLs
     if "perplexity.ai" in ob:
         ob = "https://api.perplexity.ai"
+
 
 
     gk = (os.getenv("LLM_API_KEY") or "").strip()
@@ -242,6 +250,54 @@ def call_llm(system_msg: str, user_msg: str) -> str:
 
     raise RuntimeError("No LLM credentials found. Set OPENAI_* or LLM_API_* in GitHub Secrets.")
 
+# === Chunking & caching helpers =============================================
+
+CHARS_PER_CHUNK = int(os.getenv("CHARS_PER_CHUNK", "6000"))
+CACHE_DIR = pathlib.Path(os.getenv("REVIEW_CACHE_DIR", ".ai-review-cache"))
+CACHE_DIR.mkdir(exist_ok=True)
+CACHE_TTL_SEC = int(os.getenv("REVIEW_CACHE_TTL_SEC", "0"))  # 0 = no TTL (keep forever)
+CACHE_BUSTER = os.getenv("REVIEW_CACHE_BUSTER", "").strip()  # change to forcibly invalidate
+
+def _now() -> datetime:
+    return datetime.utcnow()
+
+def _is_fresh(path: pathlib.Path) -> bool:
+    if not path.exists():
+        return False
+    if CACHE_TTL_SEC <= 0:
+        return True
+    age = _now() - datetime.utcfromtimestamp(path.stat().st_mtime)
+    return age.total_seconds() <= CACHE_TTL_SEC
+
+def estimate_tokens(text: str) -> int:
+    # Crude but effective: ~4 chars/token for English/code
+    return max(1, len(text) // 4)
+
+def chunk_text(s: str, max_chars: int = CHARS_PER_CHUNK) -> list[str]:
+    if not s:
+        return ["(empty)"]
+    return [s[i:i+max_chars] for i in range(0, len(s), max_chars)]
+
+def file_diff(base: str, head: str, path: str) -> str:
+    # Two lines of context keeps patches readable but compact
+    try:
+        return run(f'git diff --unified=2 -- "{path}" {base} {head}')
+    except Exception as e:
+        return f"[diff unavailable for {path}: {e}]"
+
+def cache_key(*parts: str) -> str:
+    m = hashlib.sha256()
+    for p in parts:
+        m.update(p.encode("utf-8", errors="ignore"))
+        m.update(b"\x00")
+    return m.hexdigest()
+
+def read_cache(key: str) -> str | None:
+    p = CACHE_DIR / f"{key}.md"
+    return p.read_text(encoding="utf-8") if _is_fresh(p) else None
+
+def write_cache(key: str, text: str) -> None:
+    (CACHE_DIR / f"{key}.md").write_text(text, encoding="utf-8")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -249,8 +305,10 @@ def main():
     ap.add_argument("--head", required=True)
     args = ap.parse_args()
 
-    diff = git_diff(args.base, args.head)[:4000]
-    if not diff.strip():
+    # Gather changed files first; if none, exit early with a friendly report
+    changed = git_changed_files(args.base, args.head).splitlines()
+    changed = [p.strip() for p in changed if p.strip()]
+    if not changed:
         with open("ai_review_report.md", "w", encoding="utf-8") as f:
             f.write(
                 "# 🤖 AI Code Review Report\n\n"
@@ -260,26 +318,59 @@ def main():
         return
 
     commit_msg = git_commit_message(args.head)
-    docs = read_docs_snippets("docs", max_chars=1000)
-    files = git_changed_files(args.base, args.head)
-    files_block = "\n".join(f"- {p}" for p in files.splitlines() if p.strip())
-
-    sys_msg, user_msg = build_prompt(commit_msg, diff, docs, files_block)
-
-    try:
-        review = call_llm(sys_msg, user_msg)
-    except Exception as e:
-        review = (
-            f"**Note:** LLM call failed in CI: {e}\n\n"
-            "Proceeding with a static stub so the pipeline stays green."
-        )
-
+    docs = read_docs_snippets("docs", max_chars=800)  # keep the RAG-lite small
     banner = (
         "# 🤖 AI Code Review Report\n\n"
-        f"**Base:** `{args.base}`  \n**Head:** `{args.head}`\n\n---\n\n"
+        f"**Base:** `{args.base}`  \n**Head:** `{args.head}`\n\n"
+        f"**Files changed ({len(changed)}):**\n"
+        + "\n".join(f"- {p}" for p in changed) + "\n\n---\n\n"
     )
+
+    # Pull knobs that affect cache identity
+    model = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
+    temp = (os.getenv("OPENAI_TEMPERATURE") or "0.2").strip()
+    max_tok = (os.getenv("OPENAI_MAX_TOKENS") or "600").strip()
+
+    report_sections = []
+
+    for path in changed:
+        diff_text = file_diff(args.base, args.head, path)
+        if not diff_text.strip():
+            # Some renames or binary files may show empty diff with current flags
+            diff_text = f"(no textual diff available for {path})"
+
+        chunks = chunk_text(diff_text, CHARS_PER_CHUNK)
+        for idx, chunk in enumerate(chunks, 1):
+            sys_msg, usr_msg = build_prompt(commit_msg, chunk, docs, f"- {path} (chunk {idx}/{len(chunks)})")
+
+            key = cache_key(
+                "v2",                   # bump if prompt shape changes
+                path,
+                str(idx),
+                model,
+                temp,
+                max_tok,
+                CACHE_BUSTER,
+                usr_msg[:1000]          # first 1k chars of the prompt captures diff
+            )
+
+            cached = read_cache(key)
+            if cached:
+                print(f"[cache] hit: {path} [{idx}/{len(chunks)}]")
+                report_sections.append(f"## {path} (chunk {idx}/{len(chunks)})\n\n" + cached)
+                continue
+
+            print(f"[review] {path} [{idx}/{len(chunks)}] (≈{estimate_tokens(chunk)} tok input)")
+            try:
+                review = call_llm(sys_msg, usr_msg)  # uses your resilient requester
+            except Exception as e:
+                review = f"**Note:** LLM call failed: {e}\n(Chunk skipped.)"
+
+            write_cache(key, review)
+            report_sections.append(f"## {path} (chunk {idx}/{len(chunks)})\n\n" + review)
+
     with open("ai_review_report.md", "w", encoding="utf-8") as f:
-        f.write(banner + review + "\n")
+        f.write(banner + "\n\n---\n\n".join(report_sections) + "\n")
     print("Wrote ai_review_report.md")
 
 
