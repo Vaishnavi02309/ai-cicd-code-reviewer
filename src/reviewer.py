@@ -69,10 +69,8 @@ def build_prompt(commit_msg: str, diff_text: str, docs_context: str, files_block
 
 
 def call_llm(system_msg: str, user_msg: str) -> str:
-    """Call OpenAI-compatible API (Chat or Responses). Fallback to generic provider."""
-    import requests
+    import requests, json, os
 
-    # Read & trim envs (avoid invalid header whitespace)
     ok = (os.getenv("OPENAI_API_KEY") or "").strip()
     ob = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
     om = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
@@ -83,23 +81,21 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     gb = (os.getenv("LLM_API_BASE") or "").strip()
 
     temperature = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
-    max_tokens = int((os.getenv("OPENAI_MAX_TOKENS") or "1000").strip())
+    max_tokens  = int((os.getenv("OPENAI_MAX_TOKENS")  or "1000").strip())
 
     if ok:
         headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
-        if org:
-            headers["OpenAI-Organization"] = org
-        if proj:
-            headers["OpenAI-Project"] = proj
+        if org:  headers["OpenAI-Organization"] = org
+        if proj: headers["OpenAI-Project"] = proj
 
-        # Try Chat Completions first
+        # 1) Try Chat Completions first
         try:
             url = ob.rstrip("/") + "/chat/completions"
             payload = {
                 "model": om,
                 "messages": [
                     {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
+                    {"role": "user",   "content": user_msg},
                 ],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -108,16 +104,18 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             if r.status_code == 404 or "Unrecognized request URL" in (r.text or ""):
                 raise RuntimeError("chat_completions_not_supported")
             r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]["content"].strip()
+            return r.json()["choices"][0]["message"]["content"].strip()
         except Exception:
-            # Fallback: Responses API (newer route some accounts use)
+            pass  # fall through to /responses
+
+        # 2) Responses attempt A: role+content objects
+        try:
             url = ob.rstrip("/") + "/responses"
             payload = {
                 "model": om,
                 "input": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
+                    {"role": "system", "content": [{"type": "text", "text": system_msg}]},
+                    {"role": "user",   "content": [{"type": "text", "text": user_msg}]},
                 ],
                 "temperature": temperature,
                 "max_output_tokens": max_tokens,
@@ -134,17 +132,29 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                         parts.append(str(c.get("text", c.get("output_text", ""))))
                 if parts:
                     return "\n".join(parts).strip()
-            return json.dumps(data)[:4000]
+            # if still no text, fall to attempt B
+        except Exception:
+            pass
+
+        # 3) Responses attempt B: simple string input
+        url = ob.rstrip("/") + "/responses"
+        payload = {
+            "model": om,
+            "input": f"{system_msg}\n\n{user_msg}",
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        if "output_text" in data:
+            return str(data["output_text"]).strip()
+        return json.dumps(data)[:4000]
 
     # Generic non-OpenAI provider
     if gk and gb:
-        import requests  # already imported; kept to be explicit
         headers = {"Authorization": f"Bearer {gk}", "Content-Type": "application/json"}
-        payload = {
-            "prompt": f"{system_msg}\n\n{user_msg}",
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
+        payload = {"prompt": f"{system_msg}\n\n{user_msg}", "max_tokens": max_tokens, "temperature": temperature}
         r = requests.post(gb.rstrip("/"), headers=headers, json=payload, timeout=60)
         r.raise_for_status()
         data = r.json()
