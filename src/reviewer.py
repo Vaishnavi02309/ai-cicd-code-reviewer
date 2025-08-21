@@ -105,55 +105,46 @@ def build_batch_prompt(
 
 def call_llm(system_msg: str, user_msg: str) -> str:
     """
-    OpenAI-compatible caller with:
-      - pre-call jitter
-      - per-attempt pacing (to avoid 429 bursts)
-      - proper 429 classification (rate vs insufficient_quota)
-      - retries with capped exponential backoff honoring Retry-After
-      - /chat/completions first, then /responses fallbacks
-      - optional Perplexity fallback (OpenAI-compatible)
+    GPT-5–friendly LLM caller:
+      - Skips /chat/completions for gpt-5* models.
+      - Uses Responses API with plain-string role content first.
+      - Falls back to single-string input.
+      - Spaces out calls (OPENAI_INTER_CALL_DELAY_SEC) and surfaces 4xx bodies.
     """
     try:
-        import requests  # ensure installed
+        import requests
     except Exception:
         return ("**Error:** Python package 'requests' is not installed. "
                 "Add it to requirements.txt or install during the workflow.")
 
-    # ---- Config (trim whitespace) -------------------------------------------
     ok   = (os.getenv("OPENAI_API_KEY") or "").strip()
     ob   = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
     om   = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
     org  = (os.getenv("OPENAI_ORG") or "").strip()
     proj = (os.getenv("OPENAI_PROJECT") or "").strip()
 
-    # Perplexity (optional, OpenAI-compatible)
-    prefer_pplx = (os.getenv("PREFER_PPLX") or "0").strip().lower() in ("1", "true", "yes")
+    # Optional Perplexity fallback (OpenAI-compatible)
+    prefer_pplx = (os.getenv("PREFER_PPLX") or "0").strip().lower() in ("1","true","yes")
     pplx_key    = (os.getenv("PPLX_API_KEY") or os.getenv("PERPLEXITY_API_KEY") or "").strip()
     pplx_base   = (os.getenv("PPLX_BASE_URL") or "https://api.perplexity.ai").strip()
     pplx_model  = (os.getenv("PPLX_MODEL") or "llama-3.1-sonar-small-128k-chat").strip()
-
     if prefer_pplx and pplx_key:
         ok, ob, om = pplx_key, pplx_base, pplx_model
-
     if "perplexity.ai" in ob:
         ob = "https://api.perplexity.ai"
 
-    gk = (os.getenv("LLM_API_KEY") or "").strip()
-    gb = (os.getenv("LLM_API_BASE") or "").strip()
-
-    # Tuning knobs (env-overridable)
     temperature   = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
-    max_tokens    = int((os.getenv("OPENAI_MAX_TOKENS") or "1200").strip())
+    max_tokens    = int((os.getenv("OPENAI_MAX_TOKENS")  or "1200").strip())
     pre_delay_raw = os.getenv("OPENAI_PRE_DELAY_SEC")
+    inter_delay   = float((os.getenv("OPENAI_INTER_CALL_DELAY_SEC") or "0.0").strip())
+    max_attempts  = int((os.getenv("OPENAI_MAX_ATTEMPTS") or "6").strip())
+    backoff_cap   = float((os.getenv("OPENAI_BACKOFF_CAP_SEC") or "45").strip())
+
+    # pre-call jitter / delay
     try:
         pre_delay = float(pre_delay_raw) if pre_delay_raw is not None else None
     except ValueError:
         pre_delay = None
-
-    max_attempts  = int((os.getenv("OPENAI_MAX_ATTEMPTS") or "6").strip())
-    backoff_cap   = float((os.getenv("OPENAI_BACKOFF_CAP_SEC") or "45").strip())
-    inter_delay   = float((os.getenv("OPENAI_INTER_CALL_DELAY_SEC") or "0.0").strip())
-
     if pre_delay is None:
         time.sleep(random.uniform(0.8, 1.8))
     elif pre_delay > 0:
@@ -161,37 +152,28 @@ def call_llm(system_msg: str, user_msg: str) -> str:
 
     print(f"[provider] base={ob} model={om} prefer_pplx={prefer_pplx}", flush=True)
 
-    def _classify_429(resp):
-        try:
-            data = resp.json() or {}
-            err  = data.get("error", {})
-            code = (err.get("code") or "").lower()
-            msg  = (err.get("message") or "").lower()
-        except Exception:
-            code = ""
-            msg  = (resp.text or "").lower()
-        if "insufficient_quota" in code or "insufficient quota" in msg or "exceeded your current quota" in msg:
-            return "quota"
-        return "rate"
+    if not ok:
+        return ("**Error:** No LLM credentials found. "
+                "Set OPENAI_* (or PPLX_*) or LLM_API_* in GitHub Secrets.")
 
-    def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 90):
+    headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
+    if org:
+        headers["OpenAI-Organization"] = org
+    if proj:
+        headers["OpenAI-Project"] = proj
+
+    def _post_with_retries(url: str, payload: dict, timeout: int = 90):
+        import requests
         last_exc = None
         for attempt in range(1, max_attempts + 1):
             try:
                 if inter_delay > 0:
                     time.sleep(inter_delay)
-
                 print(f"[http] POST {url} (attempt {attempt}/{max_attempts})", flush=True)
                 resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
 
+                # Retry on 429/5xx; expose 4xx body to help debugging
                 if resp.status_code in (429, 500, 502, 503, 504):
-                    if resp.status_code == 429:
-                        kind = _classify_429(resp)
-                        if kind == "quota":
-                            raise RuntimeError(
-                                "LLM 429: insufficient_quota "
-                                "(add billing, switch key/model, or enable fallback provider)."
-                            )
                     ra = resp.headers.get("retry-after")
                     try:
                         wait = float(ra) if ra else 0.0
@@ -203,6 +185,15 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                     time.sleep(wait)
                     last_exc = requests.HTTPError(f"{resp.status_code} {resp.reason}", response=resp)
                     continue
+
+                if 400 <= resp.status_code < 500:
+                    # Show server message to pinpoint payload issues
+                    body = ""
+                    try:
+                        body = resp.text[:800]
+                    except Exception:
+                        body = "<no body>"
+                    raise requests.HTTPError(f"{resp.status_code} {resp.reason}: {body}", response=resp)
 
                 resp.raise_for_status()
                 return resp
@@ -217,61 +208,38 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             raise last_exc
         raise RuntimeError("unexpected retry loop exit")
 
-    # ---- OpenAI-compatible path --------------------------------------------
-    if ok:
-        headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
-        if org:
-            headers["OpenAI-Organization"] = org
-        if proj:
-            headers["OpenAI-Project"] = proj
+    # -------- Responses API helpers --------
 
-        # 1) Try Chat Completions first
-        try:
-            url = ob.rstrip("/") + "/chat/completions"
-            payload = {
-                "model": om,
-                "messages": [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "temperature": temperature,
-                "max_tokens":  max_tokens,
-            }
-            r = _post_with_retries(url, headers, payload)
-            data = r.json()
-            return data["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            txt = getattr(getattr(e, "response", None), "text", "") or ""
-            if getattr(getattr(e, "response", None), "status_code", None) not in (404,) and "Unrecognized request URL" not in txt:
-                pass
-
-        # 2) Responses API attempt A (structured role/content)
-        try:
-            url = ob.rstrip("/") + "/responses"
-            payload = {
-                "model": om,
-                "input": [
-                    {"role": "system", "content": [{"type": "text", "text": system_msg}]},
-                    {"role": "user",   "content": [{"type": "text", "text": user_msg}]},
-                ],
-                "temperature":       temperature,
-                "max_output_tokens": max_tokens,
-            }
-            r = _post_with_retries(url, headers, payload)
-            data = r.json()
-            if "output_text" in data:
-                return str(data["output_text"]).strip()
-            if isinstance(data.get("content"), list):
-                parts = []
-                for c in data["content"]:
-                    if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
+    # Preferred for GPT-5: plain strings per role
+    def _call_responses_plain_roles():
+        url = ob.rstrip("/") + "/responses"
+        payload = {
+            "model": om,
+            "input": [
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            "temperature":       temperature,
+            "max_output_tokens": max_tokens,
+        }
+        r = _post_with_retries(url, payload)
+        data = r.json()
+        if "output_text" in data:
+            return str(data["output_text"]).strip()
+        if isinstance(data.get("content"), list):
+            parts = []
+            for c in data["content"]:
+                if isinstance(c, dict):
+                    if "text" in c:
+                        parts.append(str(c["text"]))
+                    elif c.get("type") in ("output_text", "text"):
                         parts.append(str(c.get("text", c.get("output_text", ""))))
-                if parts:
-                    return "\n".join(parts).strip()
-        except Exception:
-            pass
+            if parts:
+                return "\n".join(parts).strip()
+        return json.dumps(data)[:4000]
 
-        # 3) Responses API attempt B (simple string input)
+    # Fallback: single-string input (system+user merged)
+    def _call_responses_single_string():
         url = ob.rstrip("/") + "/responses"
         payload = {
             "model": om,
@@ -279,45 +247,41 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             "temperature":       temperature,
             "max_output_tokens": max_tokens,
         }
-        r = _post_with_retries(url, headers, payload)
+        r = _post_with_retries(url, payload)
         data = r.json()
         if "output_text" in data:
             return str(data["output_text"]).strip()
         return json.dumps(data)[:4000]
 
-    # ---- Generic non-OpenAI provider (simple JSON) --------------------------
-    if gk and gb:
-        headers = {"Authorization": f"Bearer {gk}", "Content-Type": "application/json"}
+    # Chat Completions (only for non-gpt-5 models)
+    def _call_chat_completions():
+        url = ob.rstrip("/") + "/chat/completions"
         payload = {
-            "prompt":      f"{system_msg}\n\n{user_msg}",
-            "max_tokens":  max_tokens,
+            "model": om,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
             "temperature": temperature,
+            "max_tokens":  max_tokens,
         }
-        url = gb.rstrip("/")
-        r = _post_with_retries(url, headers, payload)
+        r = _post_with_retries(url, payload)
         data = r.json()
-        for key in ("text", "output", "completion", "result"):
-            if key in data:
-                return str(data[key]).strip()
-        return json.dumps(data)[:4000]
+        return data["choices"][0]["message"]["content"].strip()
 
-    return ("**Error:** No LLM credentials found. "
-            "Set OPENAI_* (or PPLX_*) or LLM_API_* in GitHub Secrets.")
-
-
-# =========================
-# Chunking & caching
-# =========================
-
-CHARS_PER_CHUNK = int(os.getenv("CHARS_PER_CHUNK", "8000"))
-MAX_DIFF_CHARS   = int(os.getenv("MAX_DIFF_CHARS", "120000"))
-
-CACHE_DIR = pathlib.Path(os.getenv("REVIEW_CACHE_DIR", ".ai-review-cache"))
-CACHE_DIR.mkdir(exist_ok=True)
-CACHE_TTL_SEC = int(os.getenv("REVIEW_CACHE_TTL_SEC", "0"))
-CACHE_BUSTER  = os.getenv("REVIEW_CACHE_BUSTER", "").strip()
-
-LLM_BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "4"))
+    # -------- Decision ----------
+    if om.startswith("gpt-5"):
+        # GPT-5 path: Responses only
+        try:
+            return _call_responses_plain_roles()
+        except Exception:
+            return _call_responses_single_string()
+    else:
+        # Non GPT-5: try Chat, then Responses
+        try:
+            return _call_chat_completions()
+        except Exception:
+            return _call_responses_plain_roles()
 
 def _now() -> datetime:
     return datetime.utcnow()
