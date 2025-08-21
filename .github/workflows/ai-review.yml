@@ -69,7 +69,7 @@ jobs:
       - name: Preflight secrets & API
         if: ${{ github.event_name == 'pull_request' }}
         env:
-          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
         shell: bash
         run: |
@@ -106,26 +106,22 @@ jobs:
           OPENAI_PRE_DELAY_SEC:   ${{ secrets.OPENAI_PRE_DELAY_SEC || vars.OPENAI_PRE_DELAY_SEC || 0 }}
           OPENAI_MAX_ATTEMPTS:    ${{ secrets.OPENAI_MAX_ATTEMPTS || vars.OPENAI_MAX_ATTEMPTS || 6 }}
           OPENAI_BACKOFF_CAP_SEC: ${{ secrets.OPENAI_BACKOFF_CAP_SEC || vars.OPENAI_BACKOFF_CAP_SEC || 25 }}
-
           # Chunking + cache
           CHARS_PER_CHUNK:        ${{ secrets.CHARS_PER_CHUNK || vars.CHARS_PER_CHUNK || 6000 }}
           REVIEW_CACHE_TTL_SEC:   ${{ secrets.REVIEW_CACHE_TTL_SEC || vars.REVIEW_CACHE_TTL_SEC || 0 }}
           REVIEW_CACHE_BUSTER:    ${{ secrets.REVIEW_CACHE_BUSTER || vars.REVIEW_CACHE_BUSTER || '' }}
-
           # Perplexity (opt-in)
           PREFER_PPLX:            ${{ vars.PREFER_PPLX || '0' }}
           PPLX_API_KEY:           ${{ secrets.PPLX_API_KEY }}
           PPLX_BASE_URL:          ${{ secrets.PPLX_BASE_URL }}
           PPLX_MODEL:             ${{ secrets.PPLX_MODEL }}
-
           # Generic fallback (unused unless wired)
           LLM_API_KEY:            ${{ secrets.LLM_API_KEY }}
           LLM_API_BASE:           ${{ secrets.LLM_API_BASE }}
           PYTHONUNBUFFERED: "1"
-
         run: |
           set -e
-          timeout 300 python -m src.reviewer --base "$BASE" --head "$HEAD" || \
+          timeout 300 python -u -m src.reviewer --base "$BASE" --head "$HEAD" || \
             echo "::warning::AI reviewer exceeded time or failed. Report may be partial."
 
       - name: Upload review report (artifact)
@@ -147,20 +143,19 @@ jobs:
           name: git_insights
           path: insights.json
           if-no-files-found: warn
-          
-         # 🔍 Verify report & PR number (insert here)   
-      - name: Verify report & PR number
-              if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
-              run: |
-                echo "PR=${{ github.event.pull_request.number }}"
-                test -f ai_review_report.md && wc -c ai_review_report.md || echo "MISSING ai_review_report.md"
 
-            # Prepare a comment body with a stable marker so we can update-in-place
-            - name: Prepare AI review comment body
-              if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
-              run: |
-                echo "<!-- ai-review-report -->" > comment.md
-                cat ai_review_report.md >> comment.md
+      # 🔍 Verify report & PR number
+      - name: Verify report & PR number
+        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
+        shell: bash
+        run: |
+          echo "PR=${{ github.event.pull_request.number }}"
+          if [ -f ai_review_report.md ]; then
+            echo "Report bytes: $(wc -c < ai_review_report.md)"
+          else
+            echo "MISSING ai_review_report.md"
+          fi
+
       # Prepare a comment body with a stable marker so we can update-in-place
       - name: Prepare AI review comment body
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
@@ -187,8 +182,6 @@ jobs:
           issue-number: ${{ github.event.pull_request.number }}
           body-path: comment.md
           edit-mode: replace
-
-
 
       - name: Push workflow placeholder
         if: ${{ github.event_name == 'push' }}
