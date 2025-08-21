@@ -1,14 +1,6 @@
 name: AI Code Review
 
 on:
-  push:
-    branches: ['**']
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - '**/*.png'
-      - '**/*.jpg'
-      - '**/*.gif'
   pull_request:
     types: [opened, synchronize, reopened]
     branches: [main, master]
@@ -85,13 +77,26 @@ jobs:
 
       - name: Debug config (no secrets printed)
         shell: bash
+        env:
+          OPENAI_API_KEY:         ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL:        ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL:           ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-5-mini' }}
+          OPENAI_TEMPERATURE:     ${{ secrets.OPENAI_TEMPERATURE || vars.OPENAI_TEMPERATURE || 0.2 }}
+          OPENAI_MAX_TOKENS:      ${{ secrets.OPENAI_MAX_TOKENS || vars.OPENAI_MAX_TOKENS || 200 }}
+          OPENAI_PRE_DELAY_SEC:   ${{ secrets.OPENAI_PRE_DELAY_SEC || vars.OPENAI_PRE_DELAY_SEC || 5 }}
+          OPENAI_INTER_CALL_DELAY_SEC: ${{ secrets.OPENAI_INTER_CALL_DELAY_SEC || vars.OPENAI_INTER_CALL_DELAY_SEC || 30 }}
+          OPENAI_MAX_ATTEMPTS:    ${{ secrets.OPENAI_MAX_ATTEMPTS || vars.OPENAI_MAX_ATTEMPTS || 8 }}
+          OPENAI_BACKOFF_CAP_SEC: ${{ secrets.OPENAI_BACKOFF_CAP_SEC || vars.OPENAI_BACKOFF_CAP_SEC || 60 }}
+          CHARS_PER_CHUNK:        ${{ secrets.CHARS_PER_CHUNK || vars.CHARS_PER_CHUNK || 3000 }}
+          LLM_BATCH_SIZE:         ${{ secrets.LLM_BATCH_SIZE || vars.LLM_BATCH_SIZE || 1 }}
+          REVIEW_CACHE_TTL_SEC:   ${{ secrets.REVIEW_CACHE_TTL_SEC || vars.REVIEW_CACHE_TTL_SEC || 604800 }}
         run: |
           echo "MODEL=${OPENAI_MODEL:-unset}"
           echo "BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}"
-          echo "PREFER_PPLX=${PREFER_PPLX:-0}"
-          for v in OPENAI_MAX_TOKENS OPENAI_TEMPERATURE OPENAI_MAX_ATTEMPTS OPENAI_BACKOFF_CAP_SEC CHARS_PER_CHUNK REVIEW_CACHE_TTL_SEC; do
+          for v in OPENAI_MAX_TOKENS OPENAI_TEMPERATURE OPENAI_MAX_ATTEMPTS OPENAI_BACKOFF_CAP_SEC OPENAI_INTER_CALL_DELAY_SEC OPENAI_PRE_DELAY_SEC CHARS_PER_CHUNK LLM_BATCH_SIZE REVIEW_CACHE_TTL_SEC; do
             if [ -n "${!v}" ]; then echo "$v=set"; else echo "$v=EMPTY"; fi
           done
+
 
       - name: Run AI reviewer
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
@@ -100,18 +105,25 @@ jobs:
           # OpenAI (Secrets → Vars → default)
           OPENAI_API_KEY:         ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL:        ${{ secrets.OPENAI_BASE_URL }}
+          # 👇 Force GPT-5 Mini by default
           OPENAI_MODEL:           ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-5-mini' }}
-          OPENAI_TEMPERATURE:     ${{ secrets.OPENAI_TEMPERATURE || vars.OPENAI_TEMPERATURE || 0.2 }}
-          OPENAI_MAX_TOKENS:      ${{ secrets.OPENAI_MAX_TOKENS || vars.OPENAI_MAX_TOKENS || 700 }}
-          OPENAI_PRE_DELAY_SEC:   ${{ secrets.OPENAI_PRE_DELAY_SEC || vars.OPENAI_PRE_DELAY_SEC || 0 }}
-          OPENAI_MAX_ATTEMPTS:    ${{ secrets.OPENAI_MAX_ATTEMPTS || vars.OPENAI_MAX_ATTEMPTS || 6 }}
-          OPENAI_BACKOFF_CAP_SEC: ${{ secrets.OPENAI_BACKOFF_CAP_SEC || vars.OPENAI_BACKOFF_CAP_SEC || 25 }}
+          OPENAI_TEMPERATURE:     0.2
+          # Keep outputs short (helps free-tier limits)
+          OPENAI_MAX_TOKENS:      200
+          # Pause before first call
+          OPENAI_PRE_DELAY_SEC:   5
+          # Space out every attempt/call (heavier model ⇒ longer delay)
+          OPENAI_INTER_CALL_DELAY_SEC: 30
+          # Patient retries with capped backoff
+          OPENAI_MAX_ATTEMPTS:    8
+          OPENAI_BACKOFF_CAP_SEC: 60
           # Chunking + cache
-          CHARS_PER_CHUNK:        ${{ secrets.CHARS_PER_CHUNK || vars.CHARS_PER_CHUNK || 6000 }}
-          REVIEW_CACHE_TTL_SEC:   ${{ secrets.REVIEW_CACHE_TTL_SEC || vars.REVIEW_CACHE_TTL_SEC || 0 }}
+          CHARS_PER_CHUNK:        3000
+          LLM_BATCH_SIZE:         1
+          REVIEW_CACHE_TTL_SEC:   604800
           REVIEW_CACHE_BUSTER:    ${{ secrets.REVIEW_CACHE_BUSTER || vars.REVIEW_CACHE_BUSTER || '' }}
-          # Perplexity (opt-in)
-          PREFER_PPLX:            ${{ vars.PREFER_PPLX || '0' }}
+          # Perplexity (disabled by default)
+          PREFER_PPLX:            ${{ secrets.PREFER_PPLX || '0' }}
           PPLX_API_KEY:           ${{ secrets.PPLX_API_KEY }}
           PPLX_BASE_URL:          ${{ secrets.PPLX_BASE_URL }}
           PPLX_MODEL:             ${{ secrets.PPLX_MODEL }}
@@ -144,7 +156,6 @@ jobs:
           path: insights.json
           if-no-files-found: warn
 
-      # 🔍 Verify report & PR number
       - name: Verify report & PR number
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
         shell: bash
@@ -156,14 +167,12 @@ jobs:
             echo "MISSING ai_review_report.md"
           fi
 
-      # Prepare a comment body with a stable marker so we can update-in-place
       - name: Prepare AI review comment body
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
         run: |
           echo "<!-- ai-review-report -->" > comment.md
           cat ai_review_report.md >> comment.md
 
-      # Find an existing comment from the bot that contains our marker
       - name: Find existing AI review comment
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
         id: find_comment
@@ -173,7 +182,6 @@ jobs:
           comment-author: 'github-actions[bot]'
           body-includes: '<!-- ai-review-report -->'
 
-      # Create or update the comment (sticky)
       - name: Create or update AI review comment
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
         uses: peter-evans/create-or-update-comment@v4
@@ -182,7 +190,3 @@ jobs:
           issue-number: ${{ github.event.pull_request.number }}
           body-path: comment.md
           edit-mode: replace
-
-      - name: Push workflow placeholder
-        if: ${{ github.event_name == 'push' }}
-        run: echo "Push workflow completed (AI review runs on PRs)."
