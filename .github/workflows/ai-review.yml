@@ -147,7 +147,20 @@ jobs:
           name: git_insights
           path: insights.json
           if-no-files-found: warn
+          
+         # 🔍 Verify report & PR number (insert here)   
+      - name: Verify report & PR number
+              if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
+              run: |
+                echo "PR=${{ github.event.pull_request.number }}"
+                test -f ai_review_report.md && wc -c ai_review_report.md || echo "MISSING ai_review_report.md"
 
+            # Prepare a comment body with a stable marker so we can update-in-place
+            - name: Prepare AI review comment body
+              if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
+              run: |
+                echo "<!-- ai-review-report -->" > comment.md
+                cat ai_review_report.md >> comment.md
       # Prepare a comment body with a stable marker so we can update-in-place
       - name: Prepare AI review comment body
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
