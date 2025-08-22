@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Find BASE/HEAD
+      - name: Compute BASE/HEAD
         id: range
         run: |
           echo "BASE=$(jq -r '.pull_request.base.sha // ""' "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
@@ -29,7 +29,7 @@ jobs:
 
       - name: Run reviewer (calculator only)
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}   # <-- add this secret
           GEMINI_MODEL:   ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
         run: |
           python -u src/reviewer.py \
@@ -43,21 +43,24 @@ jobs:
           name: ai_review_report
           path: ai_review_report.md
 
-      - name: Comment review on PR
+      - name: Prepare PR comment
         if: ${{ github.event_name == 'pull_request' }}
         run: |
           echo "<!-- ai-review-report -->" > comment.md
           cat ai_review_report.md >> comment.md
-        shell: bash
-      - uses: peter-evans/find-comment@v3
+
+      - name: Find existing comment
         if: ${{ github.event_name == 'pull_request' }}
         id: find_comment
+        uses: peter-evans/find-comment@v3
         with:
           issue-number: ${{ github.event.pull_request.number }}
           comment-author: 'github-actions[bot]'
           body-includes: '<!-- ai-review-report -->'
-      - uses: peter-evans/create-or-update-comment@v4
+
+      - name: Create or update comment
         if: ${{ github.event_name == 'pull_request' }}
+        uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.find_comment.outputs.comment-id }}
           issue-number: ${{ github.event.pull_request.number }}
