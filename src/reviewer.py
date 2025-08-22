@@ -179,18 +179,27 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 print(f"[http] POST {url} (attempt {attempt}/{max_attempts})", flush=True)
                 resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
 
-                if resp.status_code in (429, 500, 502, 503, 504):
+                # Retry on rate-limit or transient server errors
+                if resp.status_code == 429:
+                    # Explicit backoff for rate limits
                     ra = resp.headers.get("retry-after")
                     try:
-                        wait = float(ra) if ra else 0.0
+                        wait = float(ra) if ra else 30.0  # default 30s if not provided
                     except Exception:
-                        wait = 0.0
-                    if wait <= 0:
-                        wait = min(2 ** attempt + random.random(), backoff_cap)
-                    print(f"[rate-limit {resp.status_code}] wait {wait:.1f}s", flush=True)
+                        wait = 30.0
+                    print(f"[rate-limit] 429 Too Many Requests → waiting {wait:.1f}s", flush=True)
                     time.sleep(wait)
                     last_exc = requests.HTTPError(f"{resp.status_code} {resp.reason}", response=resp)
                     continue
+
+                if resp.status_code in (500, 502, 503, 504):
+                    # exponential backoff for server errors
+                    wait = min(2 ** attempt + random.random(), backoff_cap)
+                    print(f"[server error {resp.status_code}] wait {wait:.1f}s", flush=True)
+                    time.sleep(wait)
+                    last_exc = requests.HTTPError(f"{resp.status_code} {resp.reason}", response=resp)
+                    continue
+
 
                 if 400 <= resp.status_code < 500:
                     body = resp.text[:800] if resp.text else "<no body>"
