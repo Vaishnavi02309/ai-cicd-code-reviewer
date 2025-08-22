@@ -108,16 +108,16 @@ def build_batch_prompt(
 
 
 # =========================
-# Robust LLM caller
+# Robust LLM caller (HF first, then OpenAI)
 # =========================
 
 def call_llm(system_msg: str, user_msg: str) -> str:
     """
-    GPT-5–friendly LLM caller:
-    - Skips /chat/completions for gpt-5* models.
-    - Uses Responses API with plain-string role content first.
-    - Falls back to single-string input.
-    - Spaces out calls (OPENAI_INTER_CALL_DELAY_SEC) and surfaces 4xx bodies.
+    Priority:
+      1) Hugging Face Inference API if HF env is present
+      2) Else OpenAI-compatible path:
+         - GPT-5* → /responses with plain roles (no temperature; use max_output_tokens)
+         - Others → /chat/completions with temperature + max_tokens
     """
     try:
         import requests
@@ -125,22 +125,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
         return ("**Error:** Python package 'requests' is not installed. "
                 "Add it to requirements.txt or install during the workflow.")
 
-    ok   = (os.getenv("OPENAI_API_KEY") or "").strip()
-    ob   = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
-    om   = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
-    org  = (os.getenv("OPENAI_ORG") or "").strip()
-    proj = (os.getenv("OPENAI_PROJECT") or "").strip()
-
-    # Optional Perplexity fallback
-    prefer_pplx = (os.getenv("PREFER_PPLX") or "0").strip().lower() in ("1","true","yes")
-    pplx_key    = (os.getenv("PPLX_API_KEY") or os.getenv("PERPLEXITY_API_KEY") or "").strip()
-    pplx_base   = (os.getenv("PPLX_BASE_URL") or "https://api.perplexity.ai").strip()
-    pplx_model  = (os.getenv("PPLX_MODEL") or "llama-3.1-sonar-small-128k-chat").strip()
-    if prefer_pplx and pplx_key:
-        ok, ob, om = pplx_key, pplx_base, pplx_model
-    if "perplexity.ai" in ob:
-        ob = "https://api.perplexity.ai"
-
+    # --------- Shared throttling config ---------
     temperature   = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
     max_tokens    = int((os.getenv("OPENAI_MAX_TOKENS")  or "1200").strip())
     pre_delay_raw = os.getenv("OPENAI_PRE_DELAY_SEC")
@@ -148,6 +133,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     max_attempts  = int((os.getenv("OPENAI_MAX_ATTEMPTS") or "6").strip())
     backoff_cap   = float((os.getenv("OPENAI_BACKOFF_CAP_SEC") or "45").strip())
 
+    # Pre-call jitter / delay
     try:
         pre_delay = float(pre_delay_raw) if pre_delay_raw is not None else None
     except ValueError:
@@ -157,17 +143,138 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     elif pre_delay > 0:
         time.sleep(pre_delay)
 
+    # ============================================================
+    #   HUGGING FACE PATH
+    # ============================================================
+    hf_key   = (os.getenv("HF_API_KEY") or os.getenv("LLM_API_KEY") or "").strip()
+    hf_base  = (os.getenv("HF_API_BASE") or os.getenv("LLM_API_BASE") or "").strip()
+    hf_model = (os.getenv("HF_MODEL") or "").strip()
+    if not hf_base and hf_model:
+        hf_base = f"https://api-inference.huggingface.co/models/{hf_model}"
+
+    def _is_hf_endpoint(url: str) -> bool:
+        return "huggingface.co" in (url or "")
+
+    if hf_key and hf_base and _is_hf_endpoint(hf_base):
+        print(f"[provider] HuggingFace base={hf_base}", flush=True)
+
+        headers_hf = {
+            "Authorization": f"Bearer {hf_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Build an instruction-style prompt that works broadly with instruct models.
+        prompt = f"{system_msg}\n\nUser:\n{user_msg}\n\nAssistant:"
+
+        payload_hf = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": max_tokens,
+                "temperature":    temperature,
+                "return_full_text": False
+            }
+        }
+
+        def _post_hf_with_retries(url: str, payload: dict, timeout: int = 90):
+            last_exc = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    if inter_delay > 0:
+                        time.sleep(inter_delay)
+                    print(f"[http] HF POST {url} (attempt {attempt}/{max_attempts})", flush=True)
+                    resp = requests.post(url, headers=headers_hf, json=payload, timeout=timeout)
+
+                    # HF uses 503 for cold start/loading, 429 for rate-limit
+                    if resp.status_code in (429, 503):
+                        ra = resp.headers.get("retry-after")
+                        try:
+                            wait = float(ra) if ra else min(2 ** attempt + random.random(), backoff_cap)
+                        except Exception:
+                            wait = min(2 ** attempt + random.random(), backoff_cap)
+                        print(f"[hf backoff {resp.status_code}] wait {wait:.1f}s", flush=True)
+                        time.sleep(wait)
+                        last_exc = Exception(f"{resp.status_code} {resp.reason}: {resp.text[:300]}")
+                        continue
+
+                    if 400 <= resp.status_code < 500:
+                        body = resp.text[:800] if resp.text else "<no body>"
+                        raise Exception(f"{resp.status_code} {resp.reason}: {body}")
+
+                    resp.raise_for_status()
+                    return resp
+                except Exception as e:
+                    wait = min(2 ** attempt + random.random(), backoff_cap)
+                    print(f"[hf network] {type(e).__name__}: {e}. wait {wait:.1f}s", flush=True)
+                    last_exc = e
+                    time.sleep(wait)
+
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("unexpected HF retry loop exit")
+
+        r = _post_hf_with_retries(hf_base.rstrip("/"), payload_hf)
+
+        # Possible shapes:
+        # 1) [{"generated_text": "..."}]
+        # 2) {"generated_text": "..."}
+        # 3) {"error":"Model ... is currently loading"}
+        try:
+            data = r.json()
+        except Exception:
+            txt = r.text.strip()
+            return txt[:4000] if txt else "(empty HF response)"
+
+        if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
+            return str(data[0]["generated_text"]).strip()
+        if isinstance(data, dict) and "generated_text" in data:
+            return str(data["generated_text"]).strip()
+        if isinstance(data, dict) and "error" in data:
+            raise RuntimeError(f"HF error: {data['error']}")
+        return json.dumps(data)[:4000]
+
+    # ============================================================
+    #   OPENAI(-compatible) PATH
+    # ============================================================
+    ok   = (os.getenv("OPENAI_API_KEY") or "").strip()
+    ob   = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
+    om   = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
+    org  = (os.getenv("OPENAI_ORG") or "").strip()
+    proj = (os.getenv("OPENAI_PROJECT") or "").strip()
+
+    # Optional Perplexity fallback (OpenAI-compatible)
+    prefer_pplx = (os.getenv("PREFER_PPLX") or "0").strip().lower() in ("1","true","yes")
+    pplx_key    = (os.getenv("PPLX_API_KEY") or os.getenv("PERPLEXITY_API_KEY") or "").strip()
+    pplx_base   = (os.getenv("PPLX_BASE_URL") or "https://api.perplexity.ai").strip()
+    pplx_model  = (os.getenv("PPLX_MODEL") or "llama-3.1-sonar-small-128k-chat").strip()
+    if prefer_pplx and pplx_key:
+        ok, ob, om = pplx_key, pplx_base, pplx_model
+    if "perplexity.ai" in ob:
+        ob = "https://api.perplexity.ai"
+
     print(f"[provider] base={ob} model={om} prefer_pplx={prefer_pplx}", flush=True)
 
     if not ok:
         return ("**Error:** No LLM credentials found. "
-                "Set OPENAI_* (or PPLX_*) or LLM_API_* in GitHub Secrets.")
+                "Set HF_API_KEY + HF_API_BASE (HuggingFace), or OPENAI_* (or PPLX_*).")
 
     headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
     if org:
         headers["OpenAI-Organization"] = org
     if proj:
         headers["OpenAI-Project"] = proj
+
+    def _classify_429(resp):
+        try:
+            data = resp.json() or {}
+            err  = data.get("error", {}) or {}
+            code = (err.get("code") or "").lower()
+            msg  = (err.get("message") or "").lower()
+        except Exception:
+            code = ""
+            msg  = (resp.text or "").lower()
+        if "insufficient_quota" in code or "insufficient quota" in msg or "exceeded your current quota" in msg:
+            return "quota"
+        return "rate"
 
     def _post_with_retries(url: str, payload: dict, timeout: int = 90):
         import requests
@@ -179,12 +286,15 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 print(f"[http] POST {url} (attempt {attempt}/{max_attempts})", flush=True)
                 resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
 
-                # Retry on rate-limit or transient server errors
+                # 429 handling
                 if resp.status_code == 429:
-                    # Explicit backoff for rate limits
+                    kind = _classify_429(resp)
+                    body = resp.text[:800] if resp.text else ""
+                    if kind == "quota":
+                        raise RuntimeError(f"QUOTA_EXCEEDED: {body}")
                     ra = resp.headers.get("retry-after")
                     try:
-                        wait = float(ra) if ra else 30.0  # default 30s if not provided
+                        wait = float(ra) if ra else 30.0
                     except Exception:
                         wait = 30.0
                     print(f"[rate-limit] 429 Too Many Requests → waiting {wait:.1f}s", flush=True)
@@ -193,13 +303,11 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                     continue
 
                 if resp.status_code in (500, 502, 503, 504):
-                    # exponential backoff for server errors
                     wait = min(2 ** attempt + random.random(), backoff_cap)
                     print(f"[server error {resp.status_code}] wait {wait:.1f}s", flush=True)
                     time.sleep(wait)
                     last_exc = requests.HTTPError(f"{resp.status_code} {resp.reason}", response=resp)
                     continue
-
 
                 if 400 <= resp.status_code < 500:
                     body = resp.text[:800] if resp.text else "<no body>"
@@ -208,6 +316,13 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 resp.raise_for_status()
                 return resp
 
+            except RuntimeError as e:
+                if "QUOTA_EXCEEDED:" in str(e):
+                    raise
+                wait = min(2 ** attempt + random.random(), backoff_cap)
+                print(f"[runtime] {e}. wait {wait:.1f}s", flush=True)
+                last_exc = e
+                time.sleep(wait)
             except requests.RequestException as e:
                 wait = min(2 ** attempt + random.random(), backoff_cap)
                 print(f"[network] {type(e).__name__}: {e}. wait {wait:.1f}s", flush=True)
@@ -218,8 +333,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             raise last_exc
         raise RuntimeError("unexpected retry loop exit")
 
-    # -------- Responses API helpers --------
-
+    # -------- Responses API helpers (for GPT-5*) --------
     def _call_responses_plain_roles():
         url = ob.rstrip("/") + "/responses"
         payload = {
@@ -228,7 +342,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 {"role": "system", "content": system_msg},
                 {"role": "user",   "content": user_msg},
             ],
-            #"temperature":       temperature,
+            # GPT-5 responses API: use max_output_tokens; do NOT send temperature
             "max_output_tokens": max_tokens,
         }
         r = _post_with_retries(url, payload)
@@ -252,7 +366,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
         payload = {
             "model": om,
             "input": f"{system_msg}\n\n{user_msg}",
-            #"temperature":       temperature,
             "max_output_tokens": max_tokens,
         }
         r = _post_with_retries(url, payload)
@@ -261,6 +374,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             return str(data["output_text"]).strip()
         return json.dumps(data)[:4000]
 
+    # -------- Chat Completions (non GPT-5) --------
     def _call_chat_completions():
         url = ob.rstrip("/") + "/chat/completions"
         payload = {
@@ -285,6 +399,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
         try:
             return _call_chat_completions()
         except Exception:
+            # fallback to responses if provider supports it
             return _call_responses_plain_roles()
 
 
@@ -362,6 +477,7 @@ def main():
         return
 
     commit_msg = git_commit_message(args.head)
+    # keep docs context modest (token-friendly)
     docs = read_docs_snippets("docs", max_chars=400)
 
     banner = (
@@ -421,7 +537,23 @@ def main():
                 review = json.dumps(review, indent=2)[:20000]
         except Exception as e:
             any_errors = True
-            review = f"**Note:** LLM call failed: {e}\n(This entire batch was skipped.)"
+            msg = str(e)
+            if "QUOTA_EXCEEDED:" in msg:
+                review = (
+                    "### Skipped: API Quota Exhausted\n"
+                    "Provider reports quota exhausted for this key.\n\n"
+                    "- Check usage/dashboard for your provider\n"
+                    "- Options: wait for reset, add billing, or switch provider.\n"
+                )
+            elif "429" in msg:
+                review = (
+                    "### Skipped: Temporary Rate Limit (429)\n"
+                    "The API is throttling requests due to free-tier limits.\n\n"
+                    "- Reduce CHARS_PER_CHUNK and/or increase OPENAI_INTER_CALL_DELAY_SEC\n"
+                    "- Re-run later when the window resets or switch to a provider with higher limits.\n"
+                )
+            else:
+                review = f"**Note:** LLM call failed: {e}\n(This entire batch was skipped.)"
 
         write_cache(key, review)
         report_blocks.append(f"## Batch {i // LLM_BATCH_SIZE + 1}\n\n" + review)
