@@ -128,7 +128,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     def _normalize_hf_base(hf_base: str, hf_model: str) -> str:
         s = (hf_base or "").strip()
         if not s and hf_model:
-            return f"https://api-inference.huggingface.co/models/{hf_model}"
+            return f"https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
 
         # Already correct
         if "api-inference.huggingface.co" in s and "/models/" in s:
@@ -151,7 +151,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                     parts[-1] = parts[-1].split("?", 1)[0]
                 if len(parts) >= 2:
                     model_id = f"{parts[0]}/{parts[1]}"
-                    return f"https://api-inference.huggingface.co/models/{model_id}"
+                    return f"https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
             except Exception:
                 pass
         return s
