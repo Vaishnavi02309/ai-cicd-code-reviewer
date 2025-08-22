@@ -57,23 +57,56 @@ jobs:
           echo "HEAD=$HEAD" >> "$GITHUB_ENV"
           echo "Using BASE=$BASE HEAD=$HEAD"
 
-      # Preflight: skip politely if secrets missing (forked PRs)
-      - name: Preflight secrets & API
+      - name: Preflight secrets & API (OpenAI or HF)
         if: ${{ github.event_name == 'pull_request' }}
         env:
+          # OpenAI
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          # Hugging Face
+          HF_API_KEY:   ${{ secrets.HF_API_KEY }}
+          HF_API_BASE:  ${{ secrets.HF_API_BASE }}
+          HF_MODEL:     ${{ vars.HF_MODEL }}
         shell: bash
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::warning::OPENAI_API_KEY missing. Likely a forked PR. Skipping AI review."
+          set -e
+          has_openai=0
+          has_hf=0
+
+          if [ -n "${OPENAI_API_KEY}" ]; then
+            has_openai=1
+          fi
+          if [ -n "${HF_API_KEY}" ] && { [ -n "${HF_MODEL}" ] || [ -n "${HF_API_BASE}" ]; }; then
+            has_hf=1
+          fi
+
+          if [ "$has_openai" -eq 0 ] && [ "$has_hf" -eq 0 ]; then
+            echo "::warning::No provider configured (need OPENAI_* or HF_API_KEY + HF_MODEL/HF_API_BASE). Skipping AI review."
             echo "SKIP_AI_REVIEW=1" >> "$GITHUB_ENV"
             exit 0
           fi
-          BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
-          curl -sS "$BASE_URL/models" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -H "Content-Type: application/json" | head -n 3 || true
+
+          # Optional quick ping for whichever provider is present (don’t fail the job if it 4xx/5xx)
+          if [ "$has_openai" -eq 1 ]; then
+            BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+            echo "Preflight: OpenAI present → $BASE_URL"
+            curl -sS "$BASE_URL/models" \
+              -H "Authorization: Bearer $OPENAI_API_KEY" \
+              -H "Content-Type: application/json" | head -n 3 || true
+          fi
+
+          if [ "$has_hf" -eq 1 ]; then
+            # If HF_API_BASE not given, derive it from HF_MODEL for logging only
+            if [ -z "${HF_API_BASE}" ] && [ -n "${HF_MODEL}" ]; then
+              HF_API_BASE="https://api-inference.huggingface.co/models/${HF_MODEL}"
+            fi
+            echo "Preflight: Hugging Face present → ${HF_API_BASE}"
+            curl -sS -X POST "${HF_API_BASE}" \
+              -H "Authorization: Bearer ${HF_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d '{"inputs":"ping"}' | head -n 1 || true
+          fi
+
 
       - name: Debug config (no secrets printed)
         shell: bash
@@ -112,35 +145,36 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
         continue-on-error: true
         env:
-          # Prefer HF
-          HF_API_KEY:  ${{ secrets.HF_API_KEY }}
-          HF_MODEL:    ${{ vars.HF_MODEL || 'HuggingFaceH4/zephyr-7b-beta' }}
-          #HF_API_BASE: ${{ secrets.HF_API_BASE }}
+          # Hugging Face (preferred when present)
+          HF_API_KEY:   ${{ secrets.HF_API_KEY }}
+          HF_API_BASE:  ${{ secrets.HF_API_BASE }}     # leave empty if using HF_MODEL
+          HF_MODEL:     ${{ vars.HF_MODEL }}           # e.g. HuggingFaceH4/zephyr-7b-beta
 
-          # Also expose via generic names (reviewer.py accepts these too)
-          LLM_API_KEY:  ${{ secrets.HF_API_KEY }}
-          LLM_API_BASE: ${{ secrets.HF_API_BASE }}
+          # OpenAI (fallback)
+          OPENAI_API_KEY:         ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL:        ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL:           ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-5-mini' }}
 
-          # (Optional) neutralize OpenAI so we don't accidentally use it
-          OPENAI_API_KEY:   ''
-          OPENAI_BASE_URL:  ''
-          OPENAI_MODEL:     gpt-5-mini   # ignored when HF is active
+          # Tuning
+          OPENAI_TEMPERATURE:     0.2
+          OPENAI_MAX_TOKENS:      300
+          OPENAI_PRE_DELAY_SEC:   3
+          OPENAI_INTER_CALL_DELAY_SEC: 10
+          OPENAI_MAX_ATTEMPTS:    6
+          OPENAI_BACKOFF_CAP_SEC: 60
 
-          # Throttling / chunking (safe defaults)
-          OPENAI_TEMPERATURE:          0.2
-          OPENAI_MAX_TOKENS:           300
-          OPENAI_PRE_DELAY_SEC:        5
-          OPENAI_INTER_CALL_DELAY_SEC: 25
-          OPENAI_MAX_ATTEMPTS:         6
-          OPENAI_BACKOFF_CAP_SEC:      60
-          CHARS_PER_CHUNK:             1000
-          LLM_BATCH_SIZE:              1
-          REVIEW_CACHE_TTL_SEC:        86400
+          # Chunking + cache
+          CHARS_PER_CHUNK:        1000
+          LLM_BATCH_SIZE:         1
+          REVIEW_CACHE_TTL_SEC:   86400
+          REVIEW_CACHE_BUSTER:    ${{ vars.REVIEW_CACHE_BUSTER || '' }}
+
           PYTHONUNBUFFERED: "1"
         run: |
           set -e
           timeout 300 python -u -m src.reviewer --base "$BASE" --head "$HEAD" || \
             echo "::warning::AI reviewer exceeded time or failed. Report may be partial."
+
 
 
       - name: Upload review report (artifact)
