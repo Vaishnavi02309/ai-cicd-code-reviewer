@@ -124,6 +124,37 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     except Exception:
         return ("**Error:** Python package 'requests' is not installed. "
                 "Add it to requirements.txt or install during the workflow.")
+    # --- Helper: normalize any HF URL (model page → inference endpoint) ---
+    def _normalize_hf_base(hf_base: str, hf_model: str) -> str:
+        s = (hf_base or "").strip()
+        if not s and hf_model:
+            return f"https://api-inference.huggingface.co/models/{hf_model}"
+
+        # Already correct
+        if "api-inference.huggingface.co" in s and "/models/" in s:
+            return s
+
+        # If someone pasted a model page like:
+        #   https://huggingface.co/org/name
+        #   https://huggingface.co/org/name/tree/main
+        #   https://huggingface.co/org/name?some=query
+        if "huggingface.co" in s:
+            try:
+                # strip scheme
+                s2 = s.split("://", 1)[-1]
+                # get path after domain
+                path = s2.split("/", 1)[1] if "/" in s2 else ""
+                # remove known UI path segments
+                parts = [p for p in path.split("/") if p and p not in ("blob", "tree", "main")]
+                # drop possible query string on last part
+                if parts:
+                    parts[-1] = parts[-1].split("?", 1)[0]
+                if len(parts) >= 2:
+                    model_id = f"{parts[0]}/{parts[1]}"
+                    return f"https://api-inference.huggingface.co/models/{model_id}"
+            except Exception:
+                pass
+        return s
 
     # --------- Shared throttling config ---------
     temperature   = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
@@ -149,11 +180,13 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     hf_key   = (os.getenv("HF_API_KEY") or os.getenv("LLM_API_KEY") or "").strip()
     hf_base  = (os.getenv("HF_API_BASE") or os.getenv("LLM_API_BASE") or "").strip()
     hf_model = (os.getenv("HF_MODEL") or "").strip()
-    if not hf_base and hf_model:
-        hf_base = f"https://api-inference.huggingface.co/models/{hf_model}"
+
+    # Normalize to proper inference endpoint if needed
+    hf_base = _normalize_hf_base(hf_base, hf_model)
 
     def _is_hf_endpoint(url: str) -> bool:
-        return "huggingface.co" in (url or "")
+        return "api-inference.huggingface.co" in (url or "")
+
 
     if hf_key and hf_base and _is_hf_endpoint(hf_base):
         print(f"[provider] HuggingFace base={hf_base}", flush=True)
