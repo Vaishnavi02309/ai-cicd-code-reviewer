@@ -114,7 +114,8 @@ jobs:
         env:
           # Prefer HF
           HF_API_KEY:  ${{ secrets.HF_API_KEY }}
-          HF_API_BASE: ${{ secrets.HF_API_BASE }}
+          HF_MODEL:    ${{ vars.HF_MODEL || 'mistralai/Mistral-7B-Instruct-v0.2' }}
+          #HF_API_BASE: ${{ secrets.HF_API_BASE }}
 
           # Also expose via generic names (reviewer.py accepts these too)
           LLM_API_KEY:  ${{ secrets.HF_API_KEY }}
