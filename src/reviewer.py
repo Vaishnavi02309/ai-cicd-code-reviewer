@@ -12,6 +12,19 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 
 # =========================
+# Config constants (must be defined before functions that use them)
+# =========================
+CHARS_PER_CHUNK = int(os.getenv("CHARS_PER_CHUNK", "8000"))
+MAX_DIFF_CHARS  = int(os.getenv("MAX_DIFF_CHARS", "120000"))
+
+CACHE_DIR = pathlib.Path(os.getenv("REVIEW_CACHE_DIR", ".ai-review-cache"))
+CACHE_DIR.mkdir(exist_ok=True)
+CACHE_TTL_SEC = int(os.getenv("REVIEW_CACHE_TTL_SEC", "0"))
+CACHE_BUSTER  = os.getenv("REVIEW_CACHE_BUSTER", "").strip()
+
+LLM_BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "4"))
+
+# =========================
 # Shell & Git helpers
 # =========================
 
@@ -46,7 +59,6 @@ def read_docs_snippets(doc_dir: str = "docs", max_chars: int = 1000) -> str:
         if any(path.endswith(ext) for ext in [".md", ".txt", ".rst"]):
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    # include filename as a weak "anchor"
                     buf.append(f"\n\n---\n# {path}\n" + f.read())
             except Exception:
                 pass
@@ -63,10 +75,6 @@ def build_batch_prompt(
     docs_context: str,
     items: List[Dict[str, str]],
 ) -> Tuple[str, str]:
-    """
-    Build a single prompt that includes multiple file/chunk diffs.
-    'items' elements must each have: path, idx, total, diff
-    """
     sys_prompt = (
         "You are a precise senior code reviewer. "
         "For each section, return actionable findings grouped by the EXACT heading shown. "
@@ -123,7 +131,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     org  = (os.getenv("OPENAI_ORG") or "").strip()
     proj = (os.getenv("OPENAI_PROJECT") or "").strip()
 
-    # Optional Perplexity fallback (OpenAI-compatible)
+    # Optional Perplexity fallback
     prefer_pplx = (os.getenv("PREFER_PPLX") or "0").strip().lower() in ("1","true","yes")
     pplx_key    = (os.getenv("PPLX_API_KEY") or os.getenv("PERPLEXITY_API_KEY") or "").strip()
     pplx_base   = (os.getenv("PPLX_BASE_URL") or "https://api.perplexity.ai").strip()
@@ -140,7 +148,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     max_attempts  = int((os.getenv("OPENAI_MAX_ATTEMPTS") or "6").strip())
     backoff_cap   = float((os.getenv("OPENAI_BACKOFF_CAP_SEC") or "45").strip())
 
-    # pre-call jitter / delay
     try:
         pre_delay = float(pre_delay_raw) if pre_delay_raw is not None else None
     except ValueError:
@@ -172,7 +179,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 print(f"[http] POST {url} (attempt {attempt}/{max_attempts})", flush=True)
                 resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
 
-                # Retry on 429/5xx; expose 4xx body to help debugging
                 if resp.status_code in (429, 500, 502, 503, 504):
                     ra = resp.headers.get("retry-after")
                     try:
@@ -187,12 +193,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                     continue
 
                 if 400 <= resp.status_code < 500:
-                    # Show server message to pinpoint payload issues
-                    body = ""
-                    try:
-                        body = resp.text[:800]
-                    except Exception:
-                        body = "<no body>"
+                    body = resp.text[:800] if resp.text else "<no body>"
                     raise requests.HTTPError(f"{resp.status_code} {resp.reason}: {body}", response=resp)
 
                 resp.raise_for_status()
@@ -210,7 +211,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
 
     # -------- Responses API helpers --------
 
-    # Preferred for GPT-5: plain strings per role
     def _call_responses_plain_roles():
         url = ob.rstrip("/") + "/responses"
         payload = {
@@ -238,7 +238,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 return "\n".join(parts).strip()
         return json.dumps(data)[:4000]
 
-    # Fallback: single-string input (system+user merged)
     def _call_responses_single_string():
         url = ob.rstrip("/") + "/responses"
         payload = {
@@ -253,7 +252,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             return str(data["output_text"]).strip()
         return json.dumps(data)[:4000]
 
-    # Chat Completions (only for non-gpt-5 models)
     def _call_chat_completions():
         url = ob.rstrip("/") + "/chat/completions"
         payload = {
@@ -269,19 +267,21 @@ def call_llm(system_msg: str, user_msg: str) -> str:
         data = r.json()
         return data["choices"][0]["message"]["content"].strip()
 
-    # -------- Decision ----------
     if om.startswith("gpt-5"):
-        # GPT-5 path: Responses only
         try:
             return _call_responses_plain_roles()
         except Exception:
             return _call_responses_single_string()
     else:
-        # Non GPT-5: try Chat, then Responses
         try:
             return _call_chat_completions()
         except Exception:
             return _call_responses_plain_roles()
+
+
+# =========================
+# Utility (cache, diff, chunking)
+# =========================
 
 def _now() -> datetime:
     return datetime.utcnow()
@@ -353,7 +353,6 @@ def main():
         return
 
     commit_msg = git_commit_message(args.head)
-    # smaller repo-docs context to reduce tokens
     docs = read_docs_snippets("docs", max_chars=400)
 
     banner = (
