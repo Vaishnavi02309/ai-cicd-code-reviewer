@@ -480,17 +480,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
     ap.add_argument("--head", required=True)
-    args = ap.parse_args()
-    
     ap.add_argument("--paths", default="", help="Comma-separated glob(s) to include (e.g., 'src/calculator.py,tools/*.py')")
     ap.add_argument("--exclude", default="", help="Comma-separated glob(s) to exclude")
+    args = ap.parse_args()
+
 
 
     changed = git_changed_files(args.base, args.head).splitlines()
     changed = [p.strip() for p in changed if p.strip()]
     
-    include = [g.strip() for g in (ap.parse_args().paths or "").split(",") if g.strip()]
-    exclude = [g.strip() for g in (ap.parse_args().exclude or "").split(",") if g.strip()]
+
+
+    CODE_EXTS = {
+        '.py', '.js', '.ts', '.tsx', '.java', '.go', '.rs', '.rb', '.php',
+        '.c', '.cpp', '.cs', '.swift', '.kt', '.kts', '.scala', '.sh',
+        '.ps1', '.yaml', '.yml', '.json', '.toml'
+    }
+    changed = [p for p in changed if any(p.lower().endswith(ext) for ext in CODE_EXTS)]
+    
+    include = [g.strip() for g in args.paths.split(",") if g.strip()]
+    exclude = [g.strip() for g in args.exclude.split(",") if g.strip()]
 
     def _match_any(path, globs):
         return any(fnmatch.fnmatch(path, g) for g in globs)
@@ -500,13 +509,6 @@ def main():
     if exclude:
         changed = [p for p in changed if not _match_any(p, exclude)]
 
-
-    CODE_EXTS = {
-        '.py', '.js', '.ts', '.tsx', '.java', '.go', '.rs', '.rb', '.php',
-        '.c', '.cpp', '.cs', '.swift', '.kt', '.kts', '.scala', '.sh',
-        '.ps1', '.yaml', '.yml', '.json', '.toml'
-    }
-    changed = [p for p in changed if any(p.lower().endswith(ext) for ext in CODE_EXTS)]
 
     if not changed:
         with open("ai_review_report.md", "w", encoding="utf-8") as f:
