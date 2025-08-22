@@ -8,11 +8,11 @@ import time
 import random
 import hashlib
 import pathlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Dict, Tuple
 
 # =========================
-# Config constants (must be defined before functions that use them)
+# Config constants (define before use)
 # =========================
 CHARS_PER_CHUNK = int(os.getenv("CHARS_PER_CHUNK", "8000"))
 MAX_DIFF_CHARS  = int(os.getenv("MAX_DIFF_CHARS", "120000"))
@@ -35,18 +35,14 @@ def run(cmd: str) -> str:
         raise RuntimeError(f"Command failed: {cmd}\n{r.stderr}")
     return r.stdout.strip()
 
-
 def git_diff(base: str, head: str) -> str:
     return run(f"git diff --unified=2 {base} {head}")
-
 
 def git_commit_message(ref: str) -> str:
     return run(f"git log -1 --pretty=%B {ref}")
 
-
 def git_changed_files(base: str, head: str) -> str:
     return run(f"git diff --name-only {base} {head}")
-
 
 # =========================
 # Docs (RAG-lite) context
@@ -64,7 +60,6 @@ def read_docs_snippets(doc_dir: str = "docs", max_chars: int = 1000) -> str:
                 pass
     out = ("\n".join(buf))[:max_chars]
     return out or "(no docs found)"
-
 
 # =========================
 # Prompt builders
@@ -106,9 +101,8 @@ def build_batch_prompt(
     user_prompt = "\n".join(parts)
     return sys_prompt, user_prompt
 
-
 # =========================
-# Robust LLM caller (HF first, then OpenAI)
+# Robust LLM caller
 # =========================
 
 def call_llm(system_msg: str, user_msg: str) -> str:
@@ -124,36 +118,39 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     except Exception:
         return ("**Error:** Python package 'requests' is not installed. "
                 "Add it to requirements.txt or install during the workflow.")
+
     # --- Helper: normalize any HF URL (model page → inference endpoint) ---
     def _normalize_hf_base(hf_base: str, hf_model: str) -> str:
+        """
+        Returns a valid Inference API endpoint like:
+          https://api-inference.huggingface.co/models/<org>/<model>
+        """
         s = (hf_base or "").strip()
-        if not s and hf_model:
-            return f"https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+        m = (hf_model or "").strip()
 
-        # Already correct
+        # Build from model id when base is missing
+        if not s and m:
+            return f"https://api-inference.huggingface.co/models/{m}"
+
+        # Already the correct API endpoint
         if "api-inference.huggingface.co" in s and "/models/" in s:
             return s
 
-        # If someone pasted a model page like:
-        #   https://huggingface.co/org/name
-        #   https://huggingface.co/org/name/tree/main
-        #   https://huggingface.co/org/name?some=query
+        # Convert human-facing model page URLs to API endpoint
         if "huggingface.co" in s:
             try:
-                # strip scheme
-                s2 = s.split("://", 1)[-1]
-                # get path after domain
+                s2 = s.split("://", 1)[-1]  # strip scheme
                 path = s2.split("/", 1)[1] if "/" in s2 else ""
-                # remove known UI path segments
                 parts = [p for p in path.split("/") if p and p not in ("blob", "tree", "main")]
-                # drop possible query string on last part
                 if parts:
-                    parts[-1] = parts[-1].split("?", 1)[0]
+                    parts[-1] = parts[-1].split("?", 1)[0]  # drop query on last seg
                 if len(parts) >= 2:
                     model_id = f"{parts[0]}/{parts[1]}"
-                    return f"https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+                    return f"https://api-inference.huggingface.co/models/{model_id}"
             except Exception:
                 pass
+
+        # Fallback
         return s
 
     # --------- Shared throttling config ---------
@@ -186,7 +183,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
 
     def _is_hf_endpoint(url: str) -> bool:
         return "api-inference.huggingface.co" in (url or "")
-
 
     if hf_key and hf_base and _is_hf_endpoint(hf_base):
         print(f"[provider] HuggingFace base={hf_base}", flush=True)
@@ -247,10 +243,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
 
         r = _post_hf_with_retries(hf_base.rstrip("/"), payload_hf)
 
-        # Possible shapes:
-        # 1) [{"generated_text": "..."}]
-        # 2) {"generated_text": "..."}
-        # 3) {"error":"Model ... is currently loading"}
+        # Parse common HF shapes
         try:
             data = r.json()
         except Exception:
@@ -288,7 +281,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
 
     if not ok:
         return ("**Error:** No LLM credentials found. "
-                "Set HF_API_KEY + HF_API_BASE (HuggingFace), or OPENAI_* (or PPLX_*).")
+                "Set HF_API_KEY + HF_MODEL (or HF_API_BASE), or OPENAI_* (or PPLX_*).")
 
     headers = {"Authorization": f"Bearer {ok}", "Content-Type": "application/json"}
     if org:
@@ -299,7 +292,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
     def _classify_429(resp):
         try:
             data = resp.json() or {}
-            err  = data.get("error", {}) or {}
+            err  = (data.get("error") or {}) or {}
             code = (err.get("code") or "").lower()
             msg  = (err.get("message") or "").lower()
         except Exception:
@@ -435,7 +428,6 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             # fallback to responses if provider supports it
             return _call_responses_plain_roles()
 
-
 # =========================
 # Utility (cache, diff, chunking)
 # =========================
@@ -479,7 +471,6 @@ def read_cache(key: str) -> str | None:
 def write_cache(key: str, text: str) -> None:
     (CACHE_DIR / f"{key}.md").write_text(text, encoding="utf-8")
 
-
 # =========================
 # Main
 # =========================
@@ -510,7 +501,7 @@ def main():
         return
 
     commit_msg = git_commit_message(args.head)
-    # keep docs context modest (token-friendly)
+    # keep the docs context small to reduce tokens
     docs = read_docs_snippets("docs", max_chars=400)
 
     banner = (
@@ -570,23 +561,7 @@ def main():
                 review = json.dumps(review, indent=2)[:20000]
         except Exception as e:
             any_errors = True
-            msg = str(e)
-            if "QUOTA_EXCEEDED:" in msg:
-                review = (
-                    "### Skipped: API Quota Exhausted\n"
-                    "Provider reports quota exhausted for this key.\n\n"
-                    "- Check usage/dashboard for your provider\n"
-                    "- Options: wait for reset, add billing, or switch provider.\n"
-                )
-            elif "429" in msg:
-                review = (
-                    "### Skipped: Temporary Rate Limit (429)\n"
-                    "The API is throttling requests due to free-tier limits.\n\n"
-                    "- Reduce CHARS_PER_CHUNK and/or increase OPENAI_INTER_CALL_DELAY_SEC\n"
-                    "- Re-run later when the window resets or switch to a provider with higher limits.\n"
-                )
-            else:
-                review = f"**Note:** LLM call failed: {e}\n(This entire batch was skipped.)"
+            review = f"**Note:** LLM call failed: {e}\n(This entire batch was skipped.)"
 
         write_cache(key, review)
         report_blocks.append(f"## Batch {i // LLM_BATCH_SIZE + 1}\n\n" + review)
@@ -599,7 +574,6 @@ def main():
                     "Consider lowering LLM_BATCH_SIZE or tokens if this persists.\n")
 
     print("Wrote ai_review_report.md")
-
 
 if __name__ == "__main__":
     main()
