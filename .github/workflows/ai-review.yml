@@ -1,179 +1,63 @@
-name: AI Code Review
+name: AI Code Review (Gemini)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [main, master]
   workflow_dispatch: {}
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   review:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      max-parallel: 1
-    permissions:
-      contents: read
-      pull-requests: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      - name: Compute DIFF SHAs
-        shell: bash
+      - name: Find BASE/HEAD
+        id: range
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-            HEAD="${{ github.sha }}"
-          else
-            BEFORE="${{ github.event.before }}"
-            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              if git rev-parse HEAD~1 >/dev/null 2>&1; then
-                BASE="$(git rev-parse HEAD~1)"
-              else
-                BASE="${{ github.sha }}"
-              fi
-            else
-              BASE="$BEFORE"
-            fi
-            HEAD="${{ github.sha }}"
-          fi
-          echo "BASE=$BASE" >> "$GITHUB_ENV"
-          echo "HEAD=$HEAD" >> "$GITHUB_ENV"
-          echo "Using BASE=$BASE HEAD=$HEAD"
+          echo "BASE=$(jq -r '.pull_request.base.sha // ""' "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "HEAD=$(jq -r '.pull_request.head.sha // env.GITHUB_SHA' "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
 
-      # Preflight: skip politely if secrets missing (forked PRs)
-      - name: Preflight secrets & API
-        if: ${{ github.event_name == 'pull_request' }}
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - run: pip install -r requirements.txt
+
+      - name: Run reviewer (calculator only)
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-        shell: bash
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL:   ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::warning::OPENAI_API_KEY missing. Likely a forked PR. Skipping AI review."
-            echo "SKIP_AI_REVIEW=1" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
-          curl -sS "$BASE_URL/models" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -H "Content-Type: application/json" | head -n 3 || true
+          python -u src/reviewer.py \
+            --base ${{ steps.range.outputs.BASE }} \
+            --head ${{ steps.range.outputs.HEAD }} \
+            --path "src/calculator.py"
 
-      - name: Debug config (no secrets printed)
-        shell: bash
-        env:
-          OPENAI_API_KEY:         ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL:        ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL:           ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-5-mini' }}
-          OPENAI_TEMPERATURE:     ${{ secrets.OPENAI_TEMPERATURE || vars.OPENAI_TEMPERATURE || 0.2 }}
-          OPENAI_MAX_TOKENS:      ${{ secrets.OPENAI_MAX_TOKENS || vars.OPENAI_MAX_TOKENS || 200 }}
-          OPENAI_PRE_DELAY_SEC:   ${{ secrets.OPENAI_PRE_DELAY_SEC || vars.OPENAI_PRE_DELAY_SEC || 5 }}
-          OPENAI_INTER_CALL_DELAY_SEC: ${{ secrets.OPENAI_INTER_CALL_DELAY_SEC || vars.OPENAI_INTER_CALL_DELAY_SEC || 30 }}
-          OPENAI_MAX_ATTEMPTS:    ${{ secrets.OPENAI_MAX_ATTEMPTS || vars.OPENAI_MAX_ATTEMPTS || 8 }}
-          OPENAI_BACKOFF_CAP_SEC: ${{ secrets.OPENAI_BACKOFF_CAP_SEC || vars.OPENAI_BACKOFF_CAP_SEC || 60 }}
-          CHARS_PER_CHUNK:        ${{ secrets.CHARS_PER_CHUNK || vars.CHARS_PER_CHUNK || 3000 }}
-          LLM_BATCH_SIZE:         ${{ secrets.LLM_BATCH_SIZE || vars.LLM_BATCH_SIZE || 1 }}
-          REVIEW_CACHE_TTL_SEC:   ${{ secrets.REVIEW_CACHE_TTL_SEC || vars.REVIEW_CACHE_TTL_SEC || 604800 }}
-        run: |
-          echo "MODEL=${OPENAI_MODEL:-unset}"
-          echo "BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}"
-          for v in OPENAI_MAX_TOKENS OPENAI_TEMPERATURE OPENAI_MAX_ATTEMPTS OPENAI_BACKOFF_CAP_SEC OPENAI_INTER_CALL_DELAY_SEC OPENAI_PRE_DELAY_SEC CHARS_PER_CHUNK LLM_BATCH_SIZE REVIEW_CACHE_TTL_SEC; do
-            if [ -n "${!v}" ]; then echo "$v=set"; else echo "$v=EMPTY"; fi
-          done
-
-
-      - name: Run AI reviewer
-        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
-        continue-on-error: true
-        env:
-          OPENAI_API_KEY:         ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_PROJECT:  ${{ secrets.OPENAI_PROJECT }} 
-          OPENAI_BASE_URL:        ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL:           ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-5-mini' }}
-          OPENAI_TEMPERATURE:     0.2
-          OPENAI_MAX_TOKENS:      200
-          OPENAI_PRE_DELAY_SEC:   5
-          OPENAI_INTER_CALL_DELAY_SEC: 30
-          OPENAI_MAX_ATTEMPTS:    8
-          OPENAI_BACKOFF_CAP_SEC: 60
-          CHARS_PER_CHUNK:        3000
-          LLM_BATCH_SIZE:         1
-          REVIEW_CACHE_TTL_SEC:   604800
-          REVIEW_CACHE_BUSTER:    ${{ secrets.REVIEW_CACHE_BUSTER || vars.REVIEW_CACHE_BUSTER || '' }}
-          PYTHONUNBUFFERED: "1"
-        run: |
-          set -e
-          python -u -m src.reviewer --base "$BASE" --head "$HEAD" \
-            --paths "src/calculator.py" \
-            --exclude "" \
-          || echo "::warning::AI reviewer exceeded time or failed. Report may be partial."
-
-
-      - name: Upload review report (artifact)
-        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
+      - name: Upload review report
         uses: actions/upload-artifact@v4
         with:
           name: ai_review_report
           path: ai_review_report.md
-          if-no-files-found: warn
 
-      - name: Run Git Insights (generate insights.json)
+      - name: Comment review on PR
         if: ${{ github.event_name == 'pull_request' }}
-        run: python -m project.cli --limit 100 --out insights.json || echo "Git Insights failed"
-
-      - name: Upload Git Insights (artifact)
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: git_insights
-          path: insights.json
-          if-no-files-found: warn
-
-      - name: Verify report & PR number
-        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
-        shell: bash
-        run: |
-          echo "PR=${{ github.event.pull_request.number }}"
-          if [ -f ai_review_report.md ]; then
-            echo "Report bytes: $(wc -c < ai_review_report.md)"
-          else
-            echo "MISSING ai_review_report.md"
-          fi
-
-      - name: Prepare AI review comment body
-        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
         run: |
           echo "<!-- ai-review-report -->" > comment.md
           cat ai_review_report.md >> comment.md
-
-      - name: Find existing AI review comment
-        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
+        shell: bash
+      - uses: peter-evans/find-comment@v3
+        if: ${{ github.event_name == 'pull_request' }}
         id: find_comment
-        uses: peter-evans/find-comment@v3
         with:
           issue-number: ${{ github.event.pull_request.number }}
           comment-author: 'github-actions[bot]'
           body-includes: '<!-- ai-review-report -->'
-
-      - name: Create or update AI review comment
-        if: ${{ github.event_name == 'pull_request' && env.SKIP_AI_REVIEW != '1' }}
-        uses: peter-evans/create-or-update-comment@v4
+      - uses: peter-evans/create-or-update-comment@v4
+        if: ${{ github.event_name == 'pull_request' }}
         with:
           comment-id: ${{ steps.find_comment.outputs.comment-id }}
           issue-number: ${{ github.event.pull_request.number }}

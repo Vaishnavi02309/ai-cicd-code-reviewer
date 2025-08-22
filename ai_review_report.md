@@ -1,20 +1,3 @@
-# 🤖 AI Code Review Report
+# AI Code Review
 
-**Base:** `76d1daa`  
-**Head:** `7f6af01`
-
-**Files changed (1):**
-- src/calculator.py
-
----
-## Batch 1
-
-**Note:** LLM call failed: 401 Unauthorized: {
-  "error": {
-    "message": "Incorrect API key provided: sk-proj-********************************************************************************************************************************************************Wv0A. You can find your API key at https://platform.openai.com/account/api-keys.",
-    "type": "invalid_request_error",
-    "param": null,
-    "code": "invalid_api_key"
-  }
-}
-(This entire batch was skipped.)
+No changes found in the selected file.
