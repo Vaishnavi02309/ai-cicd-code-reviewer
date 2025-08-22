@@ -114,10 +114,10 @@ def build_batch_prompt(
 def call_llm(system_msg: str, user_msg: str) -> str:
     """
     GPT-5–friendly LLM caller:
-      - Skips /chat/completions for gpt-5* models.
-      - Uses Responses API with plain-string role content first.
-      - Falls back to single-string input.
-      - Spaces out calls (OPENAI_INTER_CALL_DELAY_SEC) and surfaces 4xx bodies.
+    - Skips /chat/completions for gpt-5* models.
+    - Uses Responses API with plain-string role content first.
+    - Falls back to single-string input.
+    - Spaces out calls (OPENAI_INTER_CALL_DELAY_SEC) and surfaces 4xx bodies.
     """
     try:
         import requests
@@ -219,8 +219,8 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 {"role": "system", "content": system_msg},
                 {"role": "user",   "content": user_msg},
             ],
-            "temperature":       temperature,
-            "max_output_tokens": max_tokens,
+            #"temperature":       temperature,
+            "max_tokens": max_tokens,
         }
         r = _post_with_retries(url, payload)
         data = r.json()
@@ -243,8 +243,8 @@ def call_llm(system_msg: str, user_msg: str) -> str:
         payload = {
             "model": om,
             "input": f"{system_msg}\n\n{user_msg}",
-            "temperature":       temperature,
-            "max_output_tokens": max_tokens,
+            #"temperature":       temperature,
+            "max_tokens": max_tokens,
         }
         r = _post_with_retries(url, payload)
         data = r.json()
