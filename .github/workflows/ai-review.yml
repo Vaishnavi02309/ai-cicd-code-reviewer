@@ -1,69 +1,67 @@
-name: AI Code Review
+name: AI Code Review (Gemini)
 
 on:
-  push: { branches: [ main, master ] }
-  pull_request: { branches: [ main, master ] }
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   review:
     runs-on: ubuntu-latest
-    permissions: { contents: read, pull-requests: write }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      - name: Compute BASE/HEAD
+        id: range
+        run: |
+          echo "BASE=$(jq -r '.pull_request.base.sha // ""' "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
+          echo "HEAD=$(jq -r '.pull_request.head.sha // env.GITHUB_SHA' "$GITHUB_EVENT_PATH")" >> $GITHUB_OUTPUT
 
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
       - run: pip install -r requirements.txt
 
-      - name: Compute DIFF SHAs
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "BASE=${{ github.event.pull_request.base.sha }}" >> $GITHUB_ENV
-            echo "HEAD=${{ github.sha }}" >> $GITHUB_ENV
-          else
-            if [ -z "${{ github.event.before }}" ] || [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
-              git rev-parse HEAD~1 >/dev/null 2>&1 && echo "BASE=$(git rev-parse HEAD~1)" >> $GITHUB_ENV || echo "BASE=${{ github.sha }}" >> $GITHUB_ENV
-            else
-              echo "BASE=${{ github.event.before }}" >> $GITHUB_ENV
-            fi
-            echo "HEAD=${{ github.sha }}" >> $GITHUB_ENV
-          fi
-
-      - name: Run AI reviewer
+      - name: Run reviewer (calculator only)
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_API_BASE: ${{ secrets.LLM_API_BASE }}
-        run: python -m src.reviewer --base "$BASE" --head "$HEAD"
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}   # <-- add this secret
+        run: |
+          python -u src/reviewer.py \
+            --base ${{ steps.range.outputs.BASE }} \
+            --head ${{ steps.range.outputs.HEAD }} \
+            --path "src/calculator.py"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload review report
+        uses: actions/upload-artifact@v4
         with:
           name: ai_review_report
           path: ai_review_report.md
-          if-no-files-found: warn
 
-      - name: Run Git Insights
-        run: python -m project.cli --limit 100 --out insights.json || echo "Git Insights failed"
+      - name: Prepare PR comment
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          echo "<!-- ai-review-report -->" > comment.md
+          cat ai_review_report.md >> comment.md
 
-      - uses: actions/upload-artifact@v4
+      - name: Find existing comment
+        if: ${{ github.event_name == 'pull_request' }}
+        id: find_comment
+        uses: peter-evans/find-comment@v3
         with:
-          name: git_insights
-          path: insights.json
-          if-no-files-found: warn
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- ai-review-report -->'
 
-      - if: ${{ github.event_name == 'pull_request' }}
-        uses: actions/github-script@v7
+      - name: Create or update comment
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: peter-evans/create-or-update-comment@v4
         with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('ai_review_report.md','utf8');
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
-            });
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: comment.md
+          edit-mode: replace
