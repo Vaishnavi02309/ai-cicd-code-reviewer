@@ -220,7 +220,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
                 {"role": "user",   "content": user_msg},
             ],
             #"temperature":       temperature,
-            "max_tokens": max_tokens,
+            "max_output_tokens": max_tokens,
         }
         r = _post_with_retries(url, payload)
         data = r.json()
@@ -244,7 +244,7 @@ def call_llm(system_msg: str, user_msg: str) -> str:
             "model": om,
             "input": f"{system_msg}\n\n{user_msg}",
             #"temperature":       temperature,
-            "max_tokens": max_tokens,
+            "max_output_tokens": max_tokens,
         }
         r = _post_with_retries(url, payload)
         data = r.json()
