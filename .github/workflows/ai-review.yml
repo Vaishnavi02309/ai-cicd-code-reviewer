@@ -30,7 +30,6 @@ jobs:
       - name: Run reviewer (calculator only)
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}   # <-- add this secret
-          GEMINI_MODEL:   ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
         run: |
           python -u src/reviewer.py \
             --base ${{ steps.range.outputs.BASE }} \
